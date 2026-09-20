@@ -552,6 +552,73 @@ class ResubscribeGraceTests(unittest.TestCase):
         watcher._feed_set(resubscribing_since=time.time())
         watcher._feed_set(connected=True, connected_since=time.time(), last_error=None, resubscribing_since=None)
         self.assertFalse(watcher.feed_snapshot()['resubscribing'])
+
+
+class ProxySocketTests(unittest.TestCase):
+
+    class _Raw:
+
+        def __init__(self, response=b'HTTP/1.1 200 Connection established\r\n\r\n'):
+            self.response = response
+            self.sent = b''
+            self.closed = False
+
+        def sendall(self, data):
+            self.sent += data
+
+        def recv(self, _n):
+            response, self.response = self.response, b''
+            return response
+
+        def close(self):
+            self.closed = True
+
+    def test_direct_connection_when_no_proxy_is_configured(self):
+        raw = self._Raw()
+        context = mock.Mock()
+        context.wrap_socket.return_value = 'tls'
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(watcher.socket, 'create_connection', return_value=raw) as connect, \
+                mock.patch.object(watcher.ssl, 'create_default_context', return_value=context):
+            self.assertEqual(watcher.open_tls_socket('example.test', 443), 'tls')
+        connect.assert_called_once_with(('example.test', 443), timeout=20)
+        self.assertEqual(raw.sent, b'')
+        context.wrap_socket.assert_called_once_with(raw, server_hostname='example.test')
+
+    def test_http_proxy_uses_connect_before_tls(self):
+        raw = self._Raw()
+        context = mock.Mock()
+        context.wrap_socket.return_value = 'tls'
+        with mock.patch.dict(os.environ, {'HTTPS_PROXY': 'http://user:pass@127.0.0.1:7890'}, clear=True), \
+                mock.patch.object(watcher.socket, 'create_connection', return_value=raw) as connect, \
+                mock.patch.object(watcher.ssl, 'create_default_context', return_value=context):
+            self.assertEqual(watcher.open_tls_socket('example.test', 443), 'tls')
+        connect.assert_called_once_with(('127.0.0.1', 7890), timeout=20)
+        self.assertIn(b'CONNECT example.test:443 HTTP/1.1\r\n', raw.sent)
+        self.assertIn(b'Proxy-Authorization: Basic dXNlcjpwYXNz\r\n', raw.sent)
+        context.wrap_socket.assert_called_once_with(raw, server_hostname='example.test')
+
+    def test_proxy_refusal_closes_the_socket(self):
+        raw = self._Raw(b'HTTP/1.1 407 Proxy Authentication Required\r\n\r\n')
+        with mock.patch.dict(os.environ, {'HTTPS_PROXY': 'http://127.0.0.1:7890'}, clear=True), \
+                mock.patch.object(watcher.socket, 'create_connection', return_value=raw):
+            with self.assertRaises(ConnectionError):
+                watcher.open_tls_socket('example.test', 443)
+        self.assertTrue(raw.closed)
+
+    def test_windows_heartbeat_does_not_fsync_the_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            heartbeat = os.path.join(root, 'run', 'watcher_heartbeat.json')
+            with mock.patch.object(watcher, 'HEARTBEAT', heartbeat), \
+                    mock.patch.object(watcher.os, 'name', 'nt'), \
+                    mock.patch.object(watcher, 'watched_leaders', return_value=({}, None)), \
+                    mock.patch.object(watcher, 'feed_snapshot', return_value={'useful': True}), \
+                    mock.patch.object(watcher.os, 'open', side_effect=AssertionError('must not open a directory on Windows')):
+                watcher.write_heartbeat(None, None)
+            with open(heartbeat) as f:
+                self.assertTrue(json.load(f)['feed']['useful'])
+
+
 if __name__ == '__main__':
     unittest.main()
 

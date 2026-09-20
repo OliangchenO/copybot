@@ -213,6 +213,30 @@ pub fn backoff_ms(consecutive_failures: u32) -> u64 {
 pub fn escalates(ran: Duration, ended_ok: bool, healthy: Duration) -> bool {
     !ended_ok && ran < healthy
 }
+fn subscription_message(url: &str, watched: &WatchedAddresses) -> serde_json::Value {
+    let provider = url.to_ascii_lowercase();
+    if provider.contains("alchemy") {
+        let mut to: Vec<String> = vec![
+            format!("0x{CTF_EXCHANGE_V2}"),
+            format!("0x{NEG_RISK_CTF_EXCHANGE_V2}"),
+        ];
+        to.extend(watched.snapshot().into_iter().map(|a| format!("0x{a}")));
+        serde_json::json!(
+            { "jsonrpc" : "2.0", "id" : 1, "method" : "eth_subscribe", "params" :
+            ["alchemy_pendingTransactions", { "toAddress" : to }] }
+        )
+    } else if provider.contains("drpc.org") {
+        serde_json::json!(
+            { "jsonrpc" : "2.0", "id" : 1, "method" : "eth_subscribe", "params" :
+            ["drpc_pendingTransactions"] }
+        )
+    } else {
+        serde_json::json!(
+            { "jsonrpc" : "2.0", "id" : 1, "method" : "eth_subscribe", "params" :
+            ["newPendingTransactions", true] }
+        )
+    }
+}
 async fn run_socket(
     name: String,
     url: String,
@@ -260,21 +284,7 @@ async fn pump(
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    let sub = if url.contains("alchemy") {
-        let mut to: Vec<String> = vec![
-            format!("0x{CTF_EXCHANGE_V2}"), format!("0x{NEG_RISK_CTF_EXCHANGE_V2}")
-        ];
-        to.extend(watched.snapshot().into_iter().map(|a| format!("0x{a}")));
-        serde_json::json!(
-            { "jsonrpc" : "2.0", "id" : 1, "method" : "eth_subscribe", "params" :
-            ["alchemy_pendingTransactions", { "toAddress" : to }] }
-        )
-    } else {
-        serde_json::json!(
-            { "jsonrpc" : "2.0", "id" : 1, "method" : "eth_subscribe", "params" :
-            ["newPendingTransactions", true] }
-        )
-    };
+    let sub = subscription_message(url, &watched);
     ws.send(Message::Text(sub.to_string()))
         .await
         .map_err(|e| format!("subscribe send: {e}"))?;
@@ -390,5 +400,35 @@ async fn pump(
         {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drpc_uses_full_pending_transaction_subscription() {
+        let watched = WatchedAddresses::new();
+        let sub = subscription_message("wss://polygon.drpc.org", &watched);
+
+        assert_eq!(sub["params"], serde_json::json!(["drpc_pendingTransactions"]));
+    }
+
+    #[test]
+    fn generic_provider_keeps_full_transaction_flag() {
+        let watched = WatchedAddresses::new();
+        let sub = subscription_message("wss://polygon.example", &watched);
+
+        assert_eq!(sub["params"], serde_json::json!(["newPendingTransactions", true]));
+    }
+
+    #[test]
+    fn alchemy_keeps_filtered_pending_subscription() {
+        let watched = WatchedAddresses::new();
+        let sub = subscription_message("wss://polygon-mainnet.g.alchemy.com/v2/key", &watched);
+
+        assert_eq!(sub["params"][0], "alchemy_pendingTransactions");
+        assert_eq!(sub["params"][1]["toAddress"].as_array().unwrap().len(), 2);
     }
 }

@@ -270,6 +270,9 @@ fn is_political_title(t: &str) -> bool {
 fn wallet_equity_pnl(portfolio: Option<f64>, funding_basis: f64) -> Option<f64> {
     portfolio.map(|p| ((p - funding_basis) * 100.0).round() / 100.0)
 }
+fn requires_physical_cash(live: bool, side: u8) -> bool {
+    live && side == 0
+}
 fn release_cancelled(
     guard: &Option<Arc<copybot_hot::signal_guard::SignalGuard>>,
     emitter: &Arc<Emitter>,
@@ -7777,7 +7780,7 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                             );
                     }
                     Ok(mut intent) => {
-                        if intent.side == 0 {
+                        if requires_physical_cash(live, intent.side) {
                             let pol = lane.policy();
                             let deployed = lane.state.open_usd.load(Ordering::Relaxed)
                                 as f64 / MICRO;
@@ -9318,6 +9321,13 @@ mod http_handler_tests {
         assert_eq!(
             wallet_equity_pnl(Some(9_362.71 + marked.unwrap()), 10_000.0), Some(254.43)
         );
+    }
+
+    #[test]
+    fn dry_buys_skip_only_the_physical_cash_gate() {
+        assert!(!super::requires_physical_cash(false, 0));
+        assert!(super::requires_physical_cash(true, 0));
+        assert!(!super::requires_physical_cash(true, 1));
     }
     #[test]
     fn recovery_honours_a_FIXED_RATE_lane_instead_of_assuming_compounding() {

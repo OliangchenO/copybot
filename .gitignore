@@ -29,3 +29,6 @@
 deploy/copybot2.toml
 *.local.*
 .DS_Store
+
+.idea/
+.codegraph/

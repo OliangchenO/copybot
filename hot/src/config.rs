@@ -448,13 +448,23 @@ impl Root {
                     &caps,
                     &leader,
                 ) {
-                    if derived {
+                    let aggressive = l.sizing.max_effective_pct
+                        > crate::budget::MAX_EFFECTIVE_PCT;
+                    if derived && !aggressive {
                         return Err(e);
                     }
-                    eprintln!(
-                        "[{}] ⚠️  BUDGET WARNING (absolute caps, not enforced): {e}",
-                        l.name
-                    );
+                    if derived {
+                        eprintln!(
+                            "[{}] ⚠️  BUDGET ADVISORY (lane opted into {:.0}% sizing): {e}",
+                            l.name,
+                            l.sizing.max_effective_pct * 100.0
+                        );
+                    } else {
+                        eprintln!(
+                            "[{}] ⚠️  BUDGET WARNING (absolute caps, not enforced): {e}",
+                            l.name
+                        );
+                    }
                 }
                 if let Some(adv) = crate::budget::open_cap_advisory(
                     &l.name,
@@ -626,4 +636,23 @@ copy_maker_sells = false
         assert!((policy.caps.max_usd_per_fill - 233.77).abs() < 0.01);
         assert!((policy.caps.daily_usd - 654.50).abs() < 0.01);
     }
+
+    #[test]
+    fn explicit_aggressive_ceiling_allows_a_capped_twenty_percent_lane() {
+        let mut root = bankroll_root();
+        root.lane[0].sizing.pct = 0.2;
+        root.lane[0].sizing.max_effective_pct = 0.2;
+        root.lane[0].budget.bankroll_usd = Some(1_000.0);
+
+        let lanes = root
+            .build_lanes()
+            .expect("an explicit aggressive ceiling should allow capped sizing");
+        let policy = lanes[0].policy();
+
+        assert_eq!(lanes[0].cfg.sizing, Sizing::Pct(0.2));
+        assert!((policy.seed_usd - 1_000.0).abs() < 1e-9);
+        assert!((policy.caps.max_open_usd - 850.0).abs() < 0.01);
+        assert!((policy.caps.max_usd_per_fill - 212.517).abs() < 0.01);
+    }
+
 }

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 try:
     import notify
@@ -144,6 +145,8 @@ def write_heartbeat(who, problem):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, HEARTBEAT)
+    if os.name == 'nt':
+        return
     directory = os.path.dirname(HEARTBEAT) or '.'
     fd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
     try:
@@ -494,12 +497,40 @@ def reconnect_delay(consecutive):
     steps = max(0, min(int(consecutive) - 1, 20))
     return min(RECONNECT_MIN_INTERVAL_SECS * 2 ** steps, RECONNECT_MAX_INTERVAL_SECS)
 
+def open_tls_socket(host, port, timeout=20):
+    proxy = (os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+             or os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy'))
+    if not proxy:
+        raw = socket.create_connection((host, port), timeout=timeout)
+    else:
+        parsed = urllib.parse.urlparse(proxy)
+        if parsed.scheme.lower() != 'http' or not parsed.hostname:
+            raise ValueError('watcher proxy must be an http:// URL')
+        raw = socket.create_connection((parsed.hostname, parsed.port or 80), timeout=timeout)
+        headers = [f'CONNECT {host}:{port} HTTP/1.1', f'Host: {host}:{port}']
+        if parsed.username is not None:
+            user = urllib.parse.unquote(parsed.username)
+            password = urllib.parse.unquote(parsed.password or '')
+            token = base64.b64encode(f'{user}:{password}'.encode()).decode()
+            headers.append(f'Proxy-Authorization: Basic {token}')
+        raw.sendall(('\r\n'.join(headers) + '\r\n\r\n').encode())
+        response = b''
+        while b'\r\n\r\n' not in response and len(response) < 65536:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        status = response.split(b'\r\n', 1)[0]
+        if b' 200 ' not in status:
+            raw.close()
+            raise ConnectionError('watcher proxy CONNECT failed: %s' % status.decode('ascii', 'replace'))
+    return ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+
 def ws_listen():
     consecutive = 0
     while True:
         try:
-            ctx = ssl.create_default_context()
-            s = ctx.wrap_socket(socket.create_connection((LIVE, 443), timeout=20), server_hostname=LIVE)
+            s = open_tls_socket(LIVE, 443)
             k = base64.b64encode(os.urandom(16)).decode()
             s.send(f'GET / HTTP/1.1\r\nHost: {LIVE}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nOrigin: https://polymarket.com\r\nSec-WebSocket-Key: {k}\r\nSec-WebSocket-Version: 13\r\n\r\n'.encode())
             s.recv(4096)
