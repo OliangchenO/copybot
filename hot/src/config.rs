@@ -89,6 +89,8 @@ pub struct SizingToml {
     pub compound: bool,
     #[serde(default)]
     pub max_usd_per_fill: Option<f64>,
+    #[serde(default)]
+    pub min_copy_usd: f64,
     #[serde(default = "f1")]
     pub min_order_usd: f64,
     #[serde(default = "t")]
@@ -300,6 +302,7 @@ pub fn build_runtime_lane(
         sell_slippage_c: spec.sell_slippage_c.unwrap_or(RUNTIME_SELL_SLIPPAGE),
         copy_maker_sells: spec.copy_maker_sells(),
         sell_floor_frac: spec.sell_floor_frac.unwrap_or(RUNTIME_SELL_FLOOR_FRAC),
+        min_copy_usd: 0.0,
         min_order_usd: spec.min_order_usd.unwrap_or(1.0),
         max_usd_per_fill: caps.max_usd_per_fill,
         daily_budget_usd: caps.daily_usd,
@@ -501,6 +504,7 @@ impl Root {
                     .or(l.execution.slippage_c)
                     .unwrap_or(DEFAULT_SLIPPAGE),
                 sell_floor_frac: l.execution.sell_floor_frac,
+                min_copy_usd: l.sizing.min_copy_usd,
                 min_order_usd: l.sizing.min_order_usd,
                 max_usd_per_fill: caps.max_usd_per_fill,
                 daily_budget_usd: caps.daily_usd,
@@ -573,6 +577,7 @@ pct = 0.005
 compound = false
 max_effective_pct = 0.05
 min_order_usd = 1.0
+min_copy_usd = 0.5
 min_fill_floor = true
 
 [lane.budget]
@@ -614,6 +619,7 @@ control_path = "run/operator.json"
         let policy = lane.policy();
 
         assert!((policy.seed_usd - 550.0).abs() < 1e-9);
+        assert!((lane.cfg.min_copy_usd - 0.50).abs() < 1e-9);
         assert!((policy.caps.max_open_usd - 467.50).abs() < 0.01);
         assert!((policy.caps.per_market_usd - 280.50).abs() < 0.01);
         assert!((policy.caps.max_usd_per_fill - 116.88).abs() < 0.01);

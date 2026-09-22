@@ -27,6 +27,7 @@ pub enum Skip {
     PerMarketCap,
     MaxOpen,
     PriceOutOfBand,
+    BelowCopyMinimum,
     BelowVenueMinimum,
     DustAfterSizing,
     SellNoPosition,
@@ -61,6 +62,9 @@ pub struct LaneConfig {
     pub sell_slippage_c: f64,
     pub copy_maker_sells: bool,
     pub sell_floor_frac: f64,
+    /// Ignore a proportional buy target below this amount; unlike `min_order_usd`,
+    /// it never increases an order's size.
+    pub min_copy_usd: f64,
     pub min_order_usd: f64,
     pub max_usd_per_fill: f64,
     pub daily_budget_usd: f64,
@@ -99,6 +103,15 @@ impl LaneConfig {
                     self.name
                 ),
             );
+        }
+        if !(self.min_copy_usd.is_finite()
+            && self.min_copy_usd >= 0.0
+            && self.min_copy_usd <= self.min_order_usd)
+        {
+            return Err(format!(
+                "lane {}: min_copy_usd must be between $0 and min_order_usd ${}",
+                self.name, self.min_order_usd
+            ));
         }
         if self.min_buy_price <= 0.0 || self.max_buy_price >= 1.0
             || self.min_buy_price >= self.max_buy_price
@@ -561,6 +574,9 @@ impl Router {
             }
         }
         let mut usd = shares * limit;
+        if usd < c.min_copy_usd {
+            return Err(Skip::BelowCopyMinimum);
+        }
         if usd < c.min_order_usd {
             if !c.min_fill_floor || !floor_eligible {
                 return Err(Skip::BelowVenueMinimum);
@@ -772,6 +788,7 @@ mod tests {
             sell_slippage_c: 0.02,
             copy_maker_sells: false,
             sell_floor_frac: 0.5,
+            min_copy_usd: 0.0,
             min_order_usd: 1.0,
             max_usd_per_fill: 250.0,
             daily_budget_usd: 500.0,
@@ -1136,6 +1153,20 @@ mod tests {
             .expect("⛔ THE BUG: this returned BelowVenueMinimum and cost the trade");
         let usd = i.shares as f64 * i.limit;
         assert!(usd >= 1.0, "must be lifted to at least the venue floor, got ${usd:.4}");
+    }
+    #[test]
+    fn a_copy_target_below_the_configured_minimum_is_skipped_not_lifted() {
+        let mut c = cfg("example_lane_26", 1, Sizing::Pct(0.10));
+        c.min_copy_usd = 0.50;
+        c.min_fill_floor = true;
+        let r = Router::new(vec![ready_lane(c)]);
+        r.snapshot()[0].state.armed.store(true, Ordering::Relaxed);
+        let d = dec("T", 0, 0.11, 40.0, 40.0);
+        assert_eq!(
+            r.decide(0, &d, Progress { his_filled: 40.0, our_copied: 0.0 }),
+            Err(Skip::BelowCopyMinimum),
+            "a $0.44 copy target must not be lifted to the $1 order floor"
+        );
     }
     #[test]
     fn a_taker_buy_is_lifted_to_one_dollar_without_a_five_share_floor() {
@@ -2414,6 +2445,7 @@ mod route_tests {
             sell_slippage_c: 0.02,
             copy_maker_sells: false,
             sell_floor_frac: 0.5,
+            min_copy_usd: 0.0,
             min_order_usd: 1.0,
             max_usd_per_fill: 250.0,
             daily_budget_usd: 500.0,

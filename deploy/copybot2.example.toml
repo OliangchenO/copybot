@@ -31,6 +31,10 @@ mode = "pct"
 pct = 0.005
 compound = false
 max_effective_pct = 0.05
+# Skip a planned proportional buy below this amount; it is never rounded up.
+min_copy_usd = 0.5
+# Orders that pass min_copy_usd but are below this value may be lifted when
+# min_fill_floor is true. Keep this at the venue's $1 submission floor.
 min_order_usd = 1.0
 min_fill_floor = true
 

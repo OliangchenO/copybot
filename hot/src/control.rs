@@ -610,6 +610,7 @@ mod tests {
             sell_slippage_c: 0.02,
             copy_maker_sells: false,
             sell_floor_frac: 0.5,
+            min_copy_usd: 0.0,
             min_order_usd: 1.0,
             max_usd_per_fill: 250.0,
             daily_budget_usd: 500.0,
