@@ -214,6 +214,64 @@ pub async fn rpc(
     }
     v.get("result").cloned().ok_or_else(|| format!("{method}: no result"))
 }
+
+/// Parse a decimal ERC-1155 token id without adding a big-integer dependency.
+pub fn decimal_u256(input: &str) -> Result<[u8; 32], String> {
+    if input.is_empty() {
+        return Err("token id is empty".into());
+    }
+    let mut out = [0u8; 32];
+    for b in input.bytes() {
+        let digit = b
+            .checked_sub(b'0')
+            .filter(|d| *d <= 9)
+            .ok_or_else(|| "token id is not decimal".to_string())? as u16;
+        let mut carry = digit;
+        for byte in out.iter_mut().rev() {
+            let next = u16::from(*byte) * 10 + carry;
+            *byte = next as u8;
+            carry = next >> 8;
+        }
+        if carry != 0 {
+            return Err("token id exceeds uint256".into());
+        }
+    }
+    Ok(out)
+}
+
+/// Read an ERC-1155 balance from Polygon. It proves that a token absent from
+/// the portfolio API is also absent from the wallet before reconciliation.
+pub async fn ctf_balance(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    owner: &str,
+    token: &str,
+) -> Result<f64, String> {
+    let owner = crate::config::addr20(owner)?;
+    let token = decimal_u256(token)?;
+    let mut data = vec![0x00, 0xfd, 0xd5, 0x8e]; // balanceOf(address,uint256)
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(&owner);
+    data.extend_from_slice(&token);
+    let value = rpc(
+        http,
+        rpc_url,
+        "eth_call",
+        serde_json::json!([
+            { "to": format!("0x{}", hex::encode(crate::merge::CTF)),
+              "data": format!("0x{}", hex::encode(data)) },
+            "latest"
+        ]),
+    )
+    .await?;
+    let raw = value
+        .as_str()
+        .and_then(|v| v.strip_prefix("0x"))
+        .ok_or_else(|| "eth_call returned a non-hex balance".to_string())?;
+    let units = u128::from_str_radix(raw, 16)
+        .map_err(|e| format!("eth_call returned an invalid balance: {e}"))?;
+    Ok(units as f64 / 1_000_000.0)
+}
 pub async fn send_safe_call(
     http: &reqwest::Client,
     url: &str,
@@ -444,5 +502,19 @@ mod tests {
         assert_ne!(
             a, address_of(& [0x4du8; 32]).unwrap(), "different key, different address"
         );
+    }
+    #[test]
+    fn decimal_token_ids_fill_exactly_256_bits_without_overflow() {
+        let one = decimal_u256("1").expect("one parses");
+        assert_eq!(one[31], 1);
+        let max = decimal_u256(
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        )
+        .expect("uint256 max parses");
+        assert_eq!(max, [0xff; 32]);
+        assert!(decimal_u256(
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+        )
+        .is_err());
     }
 }

@@ -13,7 +13,8 @@ pub struct Bot {
     pub mode: String,
     pub clob_host: String,
     pub funder: String,
-    pub signer: String,
+    #[serde(default)]
+    pub signer: Option<String>,
     #[serde(default = "sig2")]
     pub signature_type: u8,
     pub events_path: String,
@@ -586,6 +587,22 @@ copy_maker_sells = false
 "#,
         )
         .expect("fixture must parse")
+    }
+
+    #[test]
+    fn signer_is_optional_when_the_private_key_derives_the_owner() {
+        let bot: Bot = toml::from_str(
+            r#"
+mode = "live"
+clob_host = "https://clob.polymarket.com"
+funder = "0x1111111111111111111111111111111111111111"
+events_path = "data/events.jsonl"
+control_path = "run/operator.json"
+"#,
+        )
+        .expect("a live bot may omit signer");
+
+        assert!(bot.signer.is_none());
     }
 
     #[test]

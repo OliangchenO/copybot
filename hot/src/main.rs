@@ -1755,10 +1755,12 @@ async fn main() {
     let shadow = root.bot.mode == "shadow";
     let live = root.bot.mode == "live" || shadow;
     let funder = root.bot.funder.clone();
-    let signer = root.bot.signer.clone();
+    let configured_signer = root.bot.signer.clone();
     let sig_type = root.bot.signature_type;
-    if addr20(&funder).is_err() || addr20(&signer).is_err() {
-        eprintln!("CONFIG ERROR: funder/signer must be 20-byte hex addresses");
+    if addr20(&funder).is_err()
+        || configured_signer.as_deref().is_some_and(|signer| addr20(signer).is_err())
+    {
+        eprintln!("CONFIG ERROR: funder and optional signer must be 20-byte hex addresses");
         std::process::exit(2);
     }
     let _execution_lease = if live && !shadow {
@@ -1798,27 +1800,33 @@ actually reach the venue and are refused. This key controls no funds."
         }
         (_, other) => other,
     };
-    let signer_addr: String = match pk.as_ref().map(copybot_hot::auth::address_from_key)
-    {
+    let signer_addr: String = match pk.as_ref().map(copybot_hot::auth::address_from_key) {
         Some(Ok(a)) => {
-            if !a.eq_ignore_ascii_case(&signer) {
+            if configured_signer
+                .as_deref()
+                .is_some_and(|signer| !a.eq_ignore_ascii_case(signer))
+            {
                 eprintln!(
-                    "[auth] ⚠️  config signer {signer} does NOT own PRIVATE_KEY \
+                    "[auth] ⚠️  config signer does NOT own PRIVATE_KEY \
 ({a}) — using the DERIVED owner address for authentication and signing. Fix the config."
                 );
             }
             a
         }
         Some(Err(e)) => {
+            if live && !shadow {
+                eprintln!("REFUSING TO START: cannot derive Owner EOA from PRIVATE_KEY: {e}");
+                std::process::exit(2);
+            }
             eprintln!("[auth] cannot derive signer address: {e}");
-            signer.clone()
+            configured_signer.unwrap_or_else(|| "0x0000000000000000000000000000000000000001".into())
         }
-        None => signer.clone(),
+        None if live && !shadow => {
+            eprintln!("REFUSING TO START: mode=live but PRIVATE_KEY is unset or malformed");
+            std::process::exit(2);
+        }
+        None => configured_signer.unwrap_or_else(|| "0x0000000000000000000000000000000000000001".into()),
     };
-    if live && !shadow && pk.is_none() {
-        eprintln!("REFUSING TO START: mode=live but PRIVATE_KEY is unset or malformed");
-        std::process::exit(2);
-    }
     let emitter = Arc::new(Emitter::new(root.bot.events_path.clone(), !live || shadow));
     let prints = Arc::new(copybot_hot::book::TradePrints::new());
     let levels = Arc::new(copybot_hot::book::Levels::new());
@@ -2447,6 +2455,30 @@ reads) — phantom ledger holdings will be released"
                     Some((t, sz))
                 })
                 .collect();
+            let missing_ledger_tokens: Vec<String> = held
+                .iter()
+                .filter(|(tok, shares)| **shares > 0.01 && !chain_sz.contains_key(*tok))
+                .map(|(tok, _)| tok.clone())
+                .collect();
+            let mut chain_confirmed_absent = std::collections::HashSet::new();
+            if ours_error.is_none() {
+                let rpc_url = std::env::var("FILLWATCH_RPC")
+                    .unwrap_or_else(|_| copybot_hot::txsend::DEFAULT_RPC.to_string());
+                for tok in &missing_ledger_tokens {
+                    match copybot_hot::txsend::ctf_balance(&rec_http, &rpc_url, &funder, tok).await {
+                        Ok(balance) if balance <= 1e-6 => {
+                            chain_confirmed_absent.insert(tok.clone());
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!(
+                            "[recon] {name}: cannot verify …{} by chain: {e}",
+                            &tok[tok.len().saturating_sub(8)..]
+                        ),
+                    }
+                }
+            }
+            let all_missing_confirmed_absent = !missing_ledger_tokens.is_empty()
+                && missing_ledger_tokens.len() == chain_confirmed_absent.len();
             let redeemable: std::collections::HashSet<String> = ours
                 .iter()
                 .filter(|p| p["redeemable"].as_bool().unwrap_or(false))
@@ -2459,7 +2491,8 @@ reads) — phantom ledger holdings will be released"
                 .count();
             let trustworthy = ours_error.is_none()
                 && (safe_confirmed_empty || ours_known == 0
-                    || still_there * 2 >= ours_known);
+                    || still_there * 2 >= ours_known
+                    || all_missing_confirmed_absent);
             if !trustworthy {
                 eprintln!(
                     "[recon] {name}: REFUSING snapshot — only {still_there}/{ours_known} \
@@ -2655,14 +2688,15 @@ still be holding something, check that the funder address is right."
             } else if !ours.is_empty() {
                 eprintln!("[recon] {name}: ledger matches the chain");
             }
-            if book.is_empty() && !held.is_empty() {
+            let now_held = control.lock().unwrap().ledger.holdings(&name);
+            if book.is_empty() && !now_held.is_empty() {
                 let reason = "leader position snapshot is empty while our ledger has holdings";
                 eprintln!("[seed] ⛔ {name}: {reason}; refusing to enable execution");
                 control.lock().unwrap().set_boot_fault(&name, reason);
                 continue;
             }
             let legacy = control.lock().unwrap().seed_his_book(&name, &book);
-            let now_held = control.lock().unwrap().ledger.holdings(&name).len();
+            let now_held = now_held.len();
             lane.mark_ready();
             if incidents.lock().map(|g| g.latched(&name)).unwrap_or(true) {
                 lane.state.halt_latch.store(true, Ordering::Relaxed);

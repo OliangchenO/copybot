@@ -4,7 +4,7 @@ pub const CLAIM_GRACE_SECS: i64 = 60;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 use crate::calldata::Decoded;
-use crate::venue::{ceil_shares, sell_terms, whole};
+use crate::venue::{ceil_shares, min_buy_shares_2dp, sell_terms, whole};
 pub type Micro = i64;
 pub const MICRO: f64 = 1e6;
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -540,9 +540,9 @@ impl Router {
             Ok(g) => g.clone(),
             Err(_) => return Err(Skip::NotReady),
         };
-        let mut shares = match pol.sizing {
-            Sizing::Shares(n) => ceil_shares(n),
-            Sizing::Usd(u) => whole(u / limit),
+        let (mut shares, floor_eligible) = match pol.sizing {
+            Sizing::Shares(n) => (ceil_shares(n), progress.our_copied <= 0.0),
+            Sizing::Usd(u) => (whole(u / limit), progress.our_copied <= 0.0),
             Sizing::Pct(p) => {
                 let target = progress.his_filled.max(d.fill_size)
                     * crate::budget::effective_pct(
@@ -551,26 +551,25 @@ impl Router {
                         pol.max_effective_pct,
                         pol.compound,
                     ) * (d.price / limit);
-                whole(target - progress.our_copied)
+                let remaining = target - progress.our_copied;
+                (whole(remaining), remaining > 1e-9)
             }
         };
-        let first_clip = progress.our_copied <= 0.0;
         if shares <= 0.0 {
-            if !c.min_fill_floor || !first_clip {
+            if !c.min_fill_floor || !floor_eligible {
                 return Err(Skip::DustAfterSizing);
             }
-            shares = 0.0;
         }
         let mut usd = shares * limit;
         if usd < c.min_order_usd {
-            if !c.min_fill_floor || !first_clip {
+            if !c.min_fill_floor || !floor_eligible {
                 return Err(Skip::BelowVenueMinimum);
             }
-            shares = ceil_shares(c.min_order_usd / limit);
+            // FAK buys are quote-sized: lift only to the venue's $1 notional
+            // floor at two-decimal share precision. The five-share floor
+            // applies only if this later rests.
+            shares = min_buy_shares_2dp(limit, c.min_order_usd);
             usd = shares * limit;
-        }
-        if shares < crate::venue::VENUE_MIN_SHARES {
-            return Err(Skip::BelowVenueMinimum);
         }
         let cap_fill = pol.caps.max_usd_per_fill * scale;
         if usd > cap_fill {
@@ -580,7 +579,7 @@ impl Router {
             }
             usd = shares * limit;
         }
-        if shares < crate::venue::VENUE_MIN_SHARES || usd < c.min_order_usd {
+        if usd < c.min_order_usd {
             return Err(Skip::BelowVenueMinimum);
         }
         let usd_micro = (usd * MICRO) as Micro;
@@ -701,6 +700,9 @@ pub fn resolve_route(
     let want_rest = side_enabled
         && (cfg.execution == Execution::Hybrid || intent.he_was_maker);
     if !want_rest {
+        return Route::Take;
+    }
+    if intent.shares < crate::venue::VENUE_MIN_SHARES {
         return Route::Take;
     }
     let opening_clip = if intent.side == 1 { his_first_tranche } else { first_clip };
@@ -1007,7 +1009,7 @@ mod tests {
         );
     }
     #[test]
-    fn the_VENUE_FLOOR_lifts_only_the_FIRST_clip_of_an_order() {
+    fn the_VENUE_FLOOR_does_not_buy_after_the_target_is_met() {
         let r = pct_lane(0.015);
         let d = dec("100000001", 0, 0.08, 1.0, 5_000.0);
         let first = r
@@ -1050,7 +1052,7 @@ mod tests {
                 ) else { continue };
             let usd = i.usd as f64 / MICRO;
             let intended = tranche * 0.50 * 0.015;
-            let ceiling = intended.max(1.0) + 0.52;
+            let ceiling = intended.max(1.0) + i.limit + 1e-6;
             assert!(
                 usd <= ceiling,
                 "${usd} copied unfilled size from a {tranche}-share tranche (safe ceiling ${ceiling})"
@@ -1134,23 +1136,20 @@ mod tests {
             .expect("⛔ THE BUG: this returned BelowVenueMinimum and cost the trade");
         let usd = i.shares as f64 * i.limit;
         assert!(usd >= 1.0, "must be lifted to at least the venue floor, got ${usd:.4}");
-        assert!(
-            i.shares >= crate ::venue::VENUE_MIN_SHARES,
-            "and the lift must clear the SHARE floor too, got {} shares", i.shares
-        );
     }
     #[test]
-    fn above_20_CENTS_a_sub_dollar_clip_is_SKIPPED_because_the_lift_cannot_be_legal() {
+    fn a_taker_buy_is_lifted_to_one_dollar_without_a_five_share_floor() {
         let mut c = cfg("example_lane_26", 1, Sizing::Pct(0.10));
         c.min_fill_floor = true;
         let r = Router::new(vec![ready_lane(c)]);
         r.snapshot()[0].state.armed.store(true, Ordering::Relaxed);
         let d = dec("T", 0, 0.73, 13.0, 13.0);
-        assert_eq!(
-            r.decide(0, & d, Progress { his_filled : 13.0, our_copied : 0.0 }),
-            Err(Skip::BelowVenueMinimum),
-            "the $1 lift lands at 2 shares here — the venue would refuse it"
-        );
+        let i = r
+            .decide(0, &d, Progress { his_filled: 13.0, our_copied: 0.0 })
+            .expect("a positive undersized clip should be lifted to a legal order");
+        assert!((i.shares - 1.36).abs() < 1e-9);
+        assert!(i.shares < crate::venue::VENUE_MIN_SHARES);
+        assert!(i.shares * i.limit >= 1.0);
     }
     #[test]
     fn with_the_floor_OFF_the_same_clip_is_still_SKIPPED() {
@@ -1165,28 +1164,28 @@ mod tests {
         );
     }
     #[test]
-    fn the_lift_is_FIRST_CLIP_ONLY_so_a_collapsing_ladder_cannot_repeat_it() {
+    fn a_later_positive_clip_is_lifted_to_the_minimum_legal_order() {
         let mut c = cfg("example_lane_26", 1, Sizing::Pct(0.10));
         c.min_fill_floor = true;
+        c.max_effective_pct = 0.10;
         let r = Router::new(vec![ready_lane(c)]);
         r.snapshot()[0].state.armed.store(true, Ordering::Relaxed);
-        let d = dec("T", 0, 0.08, 13.0, 130.0);
-        assert!(
-            r.decide(0, & d, Progress { his_filled : 13.0, our_copied : 5.0 }).is_err(),
-            "a later tranche must NOT be lifted — that is the ladder explosion"
-        );
+        let d = dec("T", 0, 0.08, 100.0, 100.0);
+        let i = r
+            .decide(0, &d, Progress { his_filled: 100.0, our_copied: 7.0 })
+            .expect("a positive later clip should be lifted to a legal order");
+        assert_eq!(i.shares, 10.0, "the $1 floor at a 10c limit is ten shares");
     }
     #[test]
-    fn a_clip_under_the_VENUE_SHARE_MINIMUM_is_never_sent() {
-        let mut c = cfg("vmin", 61, Sizing::Pct(0.0002));
+    fn a_taker_clip_above_one_dollar_can_be_under_five_shares() {
+        let mut c = cfg("vmin", 61, Sizing::Pct(0.0003));
         c.min_fill_floor = false;
         let r = Router::new(vec![ready_lane(c)]);
         r.lane(0).unwrap().state.armed.store(true, Ordering::Relaxed);
         let d = dec("7000001", 0, 0.69, 10_000.0, 10_000.0);
-        assert_eq!(
-            r.decide1(0, & d), Err(Skip::BelowVenueMinimum),
-            "a sub-5-share clip must be refused HERE, not by the venue"
-        );
+        let i = r.decide1(0, &d).expect("a quote-sized FAK buy above $1 is valid");
+        assert_eq!(i.shares, 2.0);
+        assert!(i.shares * i.limit >= 1.0);
     }
     #[test]
     fn CHEAP_markets_still_trade_because_the_dollar_lift_already_clears_five_shares() {
@@ -1209,17 +1208,17 @@ mod tests {
         }
     }
     #[test]
-    fn a_PER_FILL_CAP_that_lands_under_the_floor_SKIPS_instead_of_bouncing() {
+    fn a_PER_FILL_CAP_can_leave_a_valid_sub_five_share_taker_order() {
         let mut c = cfg("vcap", 63, Sizing::Pct(0.5));
         c.min_fill_floor = true;
         c.max_usd_per_fill = 2.00;
         let r = Router::new(vec![ready_lane(c)]);
         r.lane(0).unwrap().state.armed.store(true, Ordering::Relaxed);
-        assert_eq!(
-            r.decide1(0, & dec("7000003", 0, 0.90, 1_000.0, 1_000.0)),
-            Err(Skip::BelowVenueMinimum),
-            "the cap clamped under the venue floor — skip, never bounce"
-        );
+        let i = r
+            .decide1(0, &dec("7000003", 0, 0.90, 1_000.0, 1_000.0))
+            .expect("the cap still leaves at least $1 of taker notional");
+        assert_eq!(i.shares, 2.0);
+        assert!(i.shares * i.limit <= 2.0);
     }
     #[test]
     fn the_share_floor_NEVER_gates_an_EXIT() {
@@ -1326,7 +1325,7 @@ mod tests {
             Ok(i) => {
                 let usd = i.usd as f64 / MICRO;
                 assert!(
-                    usd <= 1.52,
+                    usd <= 1.0 + i.limit + 1e-6,
                     "a 1.16-share fill incorrectly copied the unfilled 5,000-share order: ${usd}"
                 );
             }
@@ -2568,6 +2567,16 @@ mod route_tests {
         assert_eq!(
             route_for(& intent(0), & c, Some(top(0.30, 0.90)), 0.30, false, false,
             false), Route::Take
+        );
+    }
+    #[test]
+    fn a_sub_five_share_hybrid_order_takes_instead_of_resting() {
+        let c = hybrid_cfg();
+        let mut i = intent(0);
+        i.shares = 2.0;
+        assert_eq!(
+            route_for(&i, &c, Some(top(0.30, 0.90)), 0.30, false, false, false),
+            Route::Take
         );
     }
     fn taker_cfg(copy_makers: bool) -> LaneConfig {

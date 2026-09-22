@@ -200,6 +200,13 @@ mod tests {
     use super::*;
     use k256::ecdsa::VerifyingKey;
 
+    #[test]
+    fn taker_buy_keeps_two_decimal_shares_and_the_limit_price() {
+        let (maker, taker) = amounts(0.75, 1.36, 0);
+        assert_eq!(maker, 1_020_000);
+        assert_eq!(taker, 1_360_000);
+    }
+
     fn recover(digest: &[u8; 32], signature: &[u8]) -> VerifyingKey {
         let sig = Signature::from_slice(&signature[..64]).unwrap();
         let recovery = RecoveryId::from_byte(signature[64] - 27).unwrap();

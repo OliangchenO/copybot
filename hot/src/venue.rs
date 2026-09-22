@@ -6,6 +6,20 @@ pub fn whole(x: f64) -> f64 {
 pub fn ceil_shares(x: f64) -> f64 {
     x.ceil()
 }
+#[inline]
+pub fn min_buy_shares_2dp(price: f64, min_usd: f64) -> f64 {
+    let mut units = ((min_usd / price * 100.0 - 1e-9).ceil()) as u64;
+    loop {
+        let shares = units as f64 / 100.0;
+        let cost_cents = price * shares * 100.0;
+        if cost_cents + 1e-9 >= min_usd * 100.0
+            && (cost_cents - cost_cents.round()).abs() < 1e-9
+        {
+            return shares;
+        }
+        units += 1;
+    }
+}
 pub const SELL_SHARE_DECIMALS: i32 = 2;
 pub const SELL_USDC_DECIMALS: i32 = 5;
 #[inline]
@@ -133,6 +147,11 @@ mod tests {
         assert_eq!(whole(5.9), 5.0);
         assert_eq!(whole(4.9999995), 5.0);
         assert_eq!(whole(0.7), 0.0);
+    }
+    #[test]
+    fn taker_floor_keeps_two_decimal_shares_and_exact_usdc_cents() {
+        assert_eq!(min_buy_shares_2dp(0.75, 1.0), 1.36);
+        assert_eq!(min_buy_shares_2dp(0.50, 1.0), 2.0);
     }
     #[test]
     fn sell_terms_obey_the_VENUES_stated_accuracy_rule() {
