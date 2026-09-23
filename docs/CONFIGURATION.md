@@ -13,6 +13,8 @@ The engine retains its existing TOML configuration format; runtime operator and 
 
 Only examples ship. Do not commit any populated layer. The bot does not load `.env` files automatically; the service templates use systemd's `EnvironmentFile` mechanism.
 
+For feed redundancy, configure two `[[feed]]` entries backed by different Polygon pending-transaction providers. `url_env` reads a `wss://` URL from the process environment; startup fails if a configured variable is missing. The watcher can independently persist observed leader fills to `run/watcher_recovery.jsonl`. Set `bot.recovery_rpc_env` to the name of an HTTPS Polygon JSON-RPC environment variable to enable recovery. Recovery fetches calldata by transaction hash and checks the live CLOB book; it accepts only a matching lane/token/side/size, a signal no more than 10 seconds old, and an executable quote within the lane's price limit. Its decisions use the normal order path. The watcher heartbeat reports exact `fire`, `skip`, inferred coverage, and misses over the retained 24-hour fill window.
+
 ## Sizing
 
 `mode = "pct"` uses a fractional copy percentage: `0.005` means 0.5%, not 5%. `shares` and `usd` are also accepted by the existing parser. Percentage copying is subject to minimum order sizes, budgets, execution prices, and the configured exit policy; it is not a guarantee of an exact share ratio.

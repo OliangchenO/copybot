@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RawTx {
     pub source: String,
     pub hash: String,
@@ -12,6 +12,7 @@ pub struct RawTx {
     pub to_neg_risk: bool,
     pub to: String,
     pub seen_ns: u128,
+    pub recovery: Option<crate::recovery::Signal>,
 }
 #[derive(Debug, Clone)]
 pub struct FeedConfig {
@@ -395,6 +396,7 @@ async fn pump(
                 to_neg_risk: neg,
                 to: to.clone(),
                 seen_ns,
+                recovery: None,
             })
             .is_err()
         {

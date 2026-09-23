@@ -12,10 +12,18 @@ ledger_path = "data/ledger.jsonl"
 signal_guard_path = "data/signal-guard.jsonl"
 recycle_secs = 0
 race_h2 = true
+# Set only when the watcher should recover fresh leader fills from chain calldata.
+recovery_rpc_env = "POLYGON_RECOVERY_RPC"
+recovery_path = "run/watcher_recovery.jsonl"
 
 [[feed]]
 name = "primary"
 url = "wss://YOUR_FEED_HOST/YOUR_FEED_PATH"
+sockets = 1
+
+[[feed]]
+name = "backup"
+url_env = "POLYGON_BACKUP_WSS"
 sockets = 1
 
 [[lane]]

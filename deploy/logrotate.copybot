@@ -36,3 +36,15 @@
     su copybot copybot
     create 0640 copybot copybot
 }
+
+/opt/copybot/run/watcher_recovery.jsonl {
+    size 5M
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su copybot copybot
+    create 0640 copybot copybot
+}

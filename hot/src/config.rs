@@ -27,6 +27,10 @@ pub struct Bot {
     pub recycle_secs: u64,
     #[serde(default)]
     pub txpool_rpc: Option<String>,
+    #[serde(default)]
+    pub recovery_rpc_env: Option<String>,
+    #[serde(default = "dflt_recovery_path")]
+    pub recovery_path: String,
     #[serde(default = "yes")]
     pub race_h2: bool,
 }
@@ -39,6 +43,9 @@ fn dflt_ledger() -> String {
 fn dflt_signal_guard() -> String {
     "data/signal-guard.jsonl".into()
 }
+fn dflt_recovery_path() -> String {
+    "run/watcher_recovery.jsonl".into()
+}
 fn yes() -> bool {
     true
 }
@@ -48,9 +55,26 @@ fn sig2() -> u8 {
 #[derive(Debug, Deserialize)]
 pub struct Feed {
     pub name: String,
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
+    pub url_env: Option<String>,
     #[serde(default = "one")]
     pub sockets: usize,
+}
+impl Feed {
+    pub fn resolved_url(&self) -> Result<String, String> {
+        let url = match &self.url_env {
+            Some(name) if self.url.is_empty() && !name.is_empty() => std::env::var(name)
+                .map_err(|_| format!("feed {}: environment variable {name} is missing", self.name))?,
+            Some(_) => return Err(format!("feed {}: set exactly one of url or url_env", self.name)),
+            None => self.url.clone(),
+        };
+        if !url.starts_with("wss://") {
+            return Err(format!("feed {}: expected a wss:// URL", self.name));
+        }
+        Ok(url)
+    }
 }
 pub fn dflt_recycle_secs() -> u64 {
     0
@@ -608,6 +632,17 @@ control_path = "run/operator.json"
         .expect("a live bot may omit signer");
 
         assert!(bot.signer.is_none());
+    }
+
+    #[test]
+    fn second_feed_uses_an_environment_url_without_embedding_it_in_toml() {
+        let feed: Feed = toml::from_str(
+            "name = \"backup\"\nurl_env = \"COPYBOT_TEST_BACKUP_WSS\"\n",
+        ).unwrap();
+        std::env::set_var("COPYBOT_TEST_BACKUP_WSS", "wss://backup.example/rpc");
+        assert_eq!(feed.resolved_url().unwrap(), "wss://backup.example/rpc");
+        std::env::remove_var("COPYBOT_TEST_BACKUP_WSS");
+        assert!(feed.resolved_url().is_err());
     }
 
     #[test]

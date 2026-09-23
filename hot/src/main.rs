@@ -1856,15 +1856,13 @@ actually reach the venue and are refused. This key controls no funds."
     let router = Arc::new(Router::new(lanes));
     let book = Arc::new(RaceBook::new());
     let stats = Arc::new(FeedStats::default());
-    let feeds: Vec<FeedConfig> = root
-        .feed
-        .iter()
-        .map(|f| FeedConfig {
-            name: f.name.clone(),
-            url: f.url.clone(),
-            sockets: f.sockets,
-        })
-        .collect();
+    let feeds: Vec<FeedConfig> = root.feed.iter().map(|f| {
+        let url = f.resolved_url().unwrap_or_else(|e| {
+            eprintln!("CONFIG ERROR: {e}");
+            std::process::exit(2);
+        });
+        FeedConfig { name: f.name.clone(), url, sockets: f.sockets }
+    }).collect();
     let total_sockets: usize = feeds.iter().map(|f| f.sockets).sum();
     emitter
         .emit(
@@ -4125,6 +4123,24 @@ declared net external funding (deposits - withdrawals); independent of lane allo
         tokio::spawn(
             txpool::run(rpc, tx.clone(), txstats.clone(), Duration::from_secs(20)),
         );
+    }
+    if let Some(env_name) = root.bot.recovery_rpc_env.as_deref() {
+        let rpc = std::env::var(env_name).unwrap_or_else(|_| {
+            eprintln!("CONFIG ERROR: recovery RPC environment variable {env_name} is missing");
+            std::process::exit(2);
+        });
+        if !rpc.starts_with("https://") && !rpc.starts_with("http://") {
+            eprintln!("CONFIG ERROR: recovery RPC {env_name} must be an HTTP URL");
+            std::process::exit(2);
+        }
+        let (recovery_events_tx, mut recovery_events_rx) = mpsc::unbounded_channel();
+        let recovery_emitter = emitter.clone();
+        tokio::spawn(async move {
+            while let Some(event) = recovery_events_rx.recv().await { recovery_emitter.emit(event); }
+        });
+        tokio::spawn(copybot_hot::recovery::run(
+            root.bot.recovery_path.clone(), rpc, root.bot.clob_host.clone(), tx.clone(), recovery_events_tx,
+        ));
     }
     {
         let (s, e, bk, wt) = (
@@ -7474,11 +7490,38 @@ user={leader}&limit=500"
     const FEED_RACE_EVERY: u64 = 250_000;
     while let Some(raw) = rx.recv().await {
         let t0 = std::time::Instant::now();
+        if let Some(signal) = &raw.recovery {
+            let mut valid = false;
+            for lane in router.snapshot() {
+                for d in decode_all(&raw.input, &lane.cfg.wallet20) {
+                    if !signal.matches(&lane.cfg.name, &raw.hash, &d.token_id, d.side, d.fill_size) {
+                        continue;
+                    }
+                    let limit = if d.side == 0 {
+                        copybot_hot::venue::buy_limit((d.price + lane.cfg.buy_slippage_c).min(0.99))
+                    } else {
+                        (d.price - lane.cfg.sell_slippage_c)
+                            .max(d.price * lane.cfg.sell_floor_frac).max(0.01)
+                    };
+                    valid = signal.quote_ok(now_ms() as i64, limit);
+                }
+            }
+            if !valid {
+                emitter.emit(serde_json::json!({"t":now_ms(), "ev":"recovery_refused",
+                    "tx":raw.hash, "tok":signal.token, "lane":signal.lane,
+                    "why":"stale, unmatched, or executable quote outside limit"}));
+                continue;
+            }
+        }
         let queue_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| (d.as_nanos().saturating_sub(raw.seen_ns)) as f64 / 1000.0)
             .unwrap_or(0.0);
-        if let Some(behind_ns) = tx_seen.first_delivery_at(&raw.hash, raw.seen_ns) {
+        // A recovery signal targets one fill; leave the transaction available to the
+        // primary feed so other fills in the same transaction still reach RaceBook.
+        if let Some(behind_ns) = raw.recovery.is_none()
+            .then(|| tx_seen.first_delivery_at(&raw.hash, raw.seen_ns))
+            .flatten() {
             behind.record(&raw.source, behind_ns);
             since_race_report += 1;
             if since_race_report >= FEED_RACE_EVERY {
@@ -7604,6 +7647,10 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                 continue;
             }
             for d in decode_all(&raw.input, &w20) {
+                if raw.recovery.as_ref().is_some_and(|s|
+                    !s.matches(&lane.cfg.name, &raw.hash, &d.token_id, d.side, d.fill_size)) {
+                    continue;
+                }
                 if lane.cfg.exclude_political
                     && politics
                         .read()
@@ -7694,7 +7741,7 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                 if !book.first_seen(&raw.source, key, None) {
                     continue;
                 }
-                if raw.source == "txpool" {
+                if raw.source == "txpool" || raw.source == "watcher_recovery" {
                     txstats_fill.rescued.fetch_add(1, Ordering::Relaxed);
                 }
                 if d.side == 0 {
@@ -7731,7 +7778,8 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                     .emit(
                                         serde_json::json!(
                                             { "t" : now_ms(), "ev" : "signal_guard_skip", "lane" : lane
-                                            .cfg.name, "tok" : d.token_id, "condition" : hex::encode(d
+                                            .cfg.name, "tx": raw.hash, "side": "BUY", "his_fill": d.fill_size,
+                                            "tok" : d.token_id, "condition" : hex::encode(d
                                             .condition_id), "his_order_id" : hex::encode(d.salt), "why"
                                             : format!("{reason:?}"), }
                                         ),
@@ -7752,7 +7800,8 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                 .emit(
                                     serde_json::json!(
                                         { "t" : now_ms(), "ev" : "signal_guard_skip", "lane" : lane
-                                        .cfg.name, "tok" : d.token_id, "condition" : hex::encode(d
+                                        .cfg.name, "tx": raw.hash, "side": "BUY", "his_fill": d.fill_size,
+                                        "tok" : d.token_id, "condition" : hex::encode(d
                                         .condition_id), "why" : format!("{reason:?}"), }
                                     ),
                                 );
@@ -7805,8 +7854,9 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                             .emit(
                                 serde_json::json!(
                                     { "t" : now_ms(), "ev" : "skip", "lane" : lane_name, "why" :
-                                    format!("{skip:?}"), "src" : raw.source, "tok" : & d
-                                    .token_id[..d.token_id.len().min(14)], "side" : if d.side ==
+                                    format!("{skip:?}"), "src" : raw.source, "tx": raw.hash,
+                                    "tok" : d.token_id, "condition": hex::encode(d.condition_id),
+                                    "side" : if d.side ==
                                     0 { "BUY" } else { "SELL" }, "px" : d.price, "his_fill" : d
                                     .fill_size, "his_order" : d.order_size, "his_order_id" :
                                     hex::encode(d.salt), "progress_committed" : d.side == 0, }
@@ -7847,8 +7897,9 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                     .emit(
                                         serde_json::json!(
                                             { "t" : now_ms(), "ev" : "skip", "lane" : lane_name, "why" :
-                                            "NoCash", "src" : raw.source, "tok" : & intent
-                                            .token_id[..intent.token_id.len().min(14)], "cost_usd" :
+                                            "NoCash", "src" : raw.source, "tx": raw.hash,
+                                            "tok" : intent.token_id, "side": "BUY", "his_fill": d.fill_size,
+                                            "his_order_id": hex::encode(d.salt), "cost_usd" :
                                             cost, "lane_available_usd" : available, "lane_seed_usd" :
                                             pol.seed_usd, "lane_deployed_usd" : deployed,
                                             "physical_cash" : free_cash, }
@@ -7938,6 +7989,9 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                             lane.state.rest_buys.load(Ordering::Relaxed),
                             lane.state.rest_sells.load(Ordering::Relaxed),
                         );
+                        if raw.recovery.is_some() {
+                            intent.route = Route::Take;
+                        }
                         let (limit, order_type) = match intent.route {
                             Route::Take => (intent.limit, "FAK"),
                             Route::RestInFront { limit, .. } => (limit, "GTC"),

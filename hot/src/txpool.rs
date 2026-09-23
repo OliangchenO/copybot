@@ -74,6 +74,7 @@ pub async fn run(
                         to_neg_risk: is_neg,
                         to: to.trim_start_matches("0x").to_ascii_lowercase(),
                         seen_ns: now_ns,
+                        recovery: None,
                     })
                     .is_err()
                 {

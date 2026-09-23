@@ -8,6 +8,78 @@ import watcher
 
 class WatcherSafetyTests(unittest.TestCase):
 
+    def test_recovery_queue_persists_exact_leader_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'recovery.jsonl')
+            fill = {'ts': 1000.125, 'tx': '0xabc', 'token': '123', 'side': 'BUY',
+                    'size': 5.25, 'leader_lane': 'example_lane_26'}
+            with mock.patch.object(watcher, 'RECOVERY_PATH', path):
+                watcher.append_recovery_signal(fill)
+            with open(path) as f:
+                row = json.loads(f.readline())
+            self.assertEqual(row, {'t': 1000125, 'tx': '0xabc', 'token': '123',
+                                   'side': 'BUY', 'size': 5.25, 'lane': 'example_lane_26'})
+
+    def test_new_decisions_require_exact_transaction_token_and_side(self):
+        fill = {'ts': 1000.0, 'token': '123', 'side': 'BUY', 'tx': '0xabc',
+                'size': 5.0, 'leader_lane': 'example_lane_26'}
+        decision = {'ts': 1001.0, 'kind': 'skip', 'token': '123', 'side': 'BUY',
+                    'tx': '0xabc', 'size': 5.0, 'lane': 'example_lane_26'}
+        self.assertIsNotNone(watcher.exact_decision(fill, [decision]))
+        self.assertIsNone(watcher.exact_decision(fill, [dict(decision, tx='0xother')]))
+        self.assertIsNone(watcher.exact_decision(fill, [dict(decision, side='SELL')]))
+        self.assertIsNone(watcher.exact_decision(fill, [dict(decision, size=50.0)]))
+
+    def test_exact_transaction_tolerates_cross_feed_size_drift(self):
+        fill = {'ts': 1000.0, 'token': '123', 'side': 'BUY', 'tx': '0xabc',
+                'size': 12.0, 'leader_lane': 'example_lane_26'}
+        decision = {'ts': 999.0, 'kind': 'skip', 'token': '123', 'side': 'BUY',
+                    'tx': '0xabc', 'size': 10.1, 'lane': 'example_lane_26'}
+        self.assertIsNotNone(watcher.exact_decision(fill, [decision]))
+        self.assertIsNone(watcher.exact_decision(fill, [dict(decision, size=50.0)]))
+        self.assertIsNone(watcher.exact_decision(fill, [decision, dict(decision, size=10.2)]))
+
+    def test_exact_transaction_matches_public_fill_to_decoded_order_size(self):
+        fill = {'token': '123', 'side': 'BUY', 'tx': '0xabc', 'size': 50.26,
+                'leader_lane': 'example_lane_26'}
+        decision = {'kind': 'fire', 'token': '123', 'side': 'BUY', 'tx': '0xabc',
+                    'size': 40.016, 'order_size': 50.26, 'lane': 'example_lane_26'}
+        self.assertIsNotNone(watcher.exact_decision(fill, [decision]))
+
+    def test_unique_exact_transaction_fire_is_not_a_missing_fire_when_sizes_diverge(self):
+        fill = {'token': '123', 'side': 'BUY', 'tx': '0xabc', 'size': 63.8,
+                'leader_lane': 'example_lane_26'}
+        fire = {'kind': 'fire', 'token': '123', 'side': 'BUY', 'tx': '0xabc',
+                'size': 50.15, 'lane': 'example_lane_26'}
+        self.assertIs(watcher.exact_decision(fill, [fire]), fire)
+        self.assertIsNone(watcher.exact_decision(fill, [fire, dict(fire, size=40.0)]))
+
+    def test_heartbeat_counts_exact_and_inferred_coverage_separately(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, 'heartbeat.json')
+            now = time.time()
+            with watcher.lock:
+                watcher.his_fills.clear()
+                watcher.his_fills.extend([
+                    {'ts': now, 'outcome': 'fire', 'decision_lag_secs': 1.0},
+                    {'ts': now, 'outcome': 'skip', 'decision_lag_secs': 12.0, 'size_mismatch': True},
+                    {'ts': now, 'outcome': 'inferred'}, {'ts': now, 'outcome': 'miss'},
+                    {'ts': now - watcher.MARKET_COOLDOWN_SECS - 1, 'outcome': 'miss'},
+                ])
+            try:
+                with mock.patch.object(watcher, 'HEARTBEAT', path), \
+                     mock.patch.object(watcher, 'watched_leaders', return_value=({}, None)):
+                    watcher.write_heartbeat('copybot', None)
+                with open(path) as f:
+                    counts = json.load(f)['fills']
+                self.assertEqual(counts['exact_accounted'], 2)
+                self.assertEqual(counts['exact_accounted_10s'], 1)
+                self.assertEqual(counts['judged'], 4)
+                self.assertEqual(counts['size_mismatches'], 1)
+            finally:
+                with watcher.lock:
+                    watcher.his_fills.clear()
+
     @staticmethod
     def _operator(root, armed):
         run = os.path.join(root, 'run')
@@ -52,10 +124,10 @@ class WatcherSafetyTests(unittest.TestCase):
         self.assertTrue(watcher.fill_is_covered(fill, [exact], grace=45))
         self.assertTrue(watcher.fill_is_covered(fill, [nearby], grace=45))
 
-    def test_buy_on_other_outcome_is_covered_by_condition_quarantine(self):
+    def test_buy_on_other_outcome_needs_its_own_transaction_decision(self):
         fill = {'ts': 1000.0, 'token': 'no-token', 'condition': 'market', 'side': 'BUY', 'tx': 'later-partial'}
         fire = {'ts': 500.0, 'token': 'yes-token', 'condition': 'market', 'side': 'BUY', 'tx': 'first-partial'}
-        self.assertTrue(watcher.fill_is_covered(fill, [fire], grace=45))
+        self.assertFalse(watcher.fill_is_covered(fill, [fire], grace=45))
 
     def test_matching_dust_skip_covers_only_that_fill(self):
         fill = {'ts': 1000.0, 'token': '123456789', 'condition': 'market', 'side': 'BUY', 'tx': 'public-tx', 'size': 22.02}

@@ -42,6 +42,7 @@ pub mod presign;
 pub mod race;
 pub mod reanchor;
 pub mod race_send;
+pub mod recovery;
 pub mod resting;
 pub mod restwatch;
 pub mod snapshot;

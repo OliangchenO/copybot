@@ -53,7 +53,19 @@ fills_dropped = 0
 _dropped_alerted = 0
 lock = threading.Lock()
 ALERTS_PATH = os.environ.get('WATCHER_ALERTS', os.path.join(BOT_DIR, 'run', 'watcher_alerts.jsonl'))
+RECOVERY_PATH = os.environ.get('WATCHER_RECOVERY_PATH', os.path.join(BOT_DIR, 'run', 'watcher_recovery.jsonl'))
 _alert_seq = [0]
+
+def append_recovery_signal(fill):
+    if not fill.get('tx') or not fill.get('token') or fill.get('side') not in ('BUY', 'SELL'):
+        return
+    row = {k: fill[k] for k in ('tx', 'token', 'side', 'size')}
+    row.update(t=int(fill['ts'] * 1000), lane=fill['leader_lane'])
+    os.makedirs(os.path.dirname(RECOVERY_PATH) or '.', exist_ok=True)
+    with open(RECOVERY_PATH, 'a') as f:
+        f.write(json.dumps(row, separators=(',', ':')) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
 
 def append_alert(level, kind, msg, lanes=None):
     _alert_seq[0] += 1
@@ -138,10 +150,19 @@ def watched_leaders():
 
 def write_heartbeat(who, problem):
     leaders, leaders_err = watched_leaders()
+    with lock:
+        recent = [f for f in his_fills if float(f.get('ts', 0)) >= time.time() - MARKET_COOLDOWN_SECS]
+        outcomes = dict(collections.Counter(f.get('outcome', 'pending') for f in recent))
+        size_mismatches = sum(1 for f in recent if f.get('size_mismatch'))
+        on_time = sum(1 for f in recent if f.get('outcome') in ('fire', 'skip')
+                      and f.get('decision_lag_secs') is not None
+                      and f['decision_lag_secs'] <= 10)
+    judged = sum(outcomes.get(k, 0) for k in ('fire', 'skip', 'would_fire', 'inferred', 'miss'))
+    accounted = outcomes.get('fire', 0) + outcomes.get('skip', 0)
     os.makedirs(os.path.dirname(HEARTBEAT), exist_ok=True)
     tmp = HEARTBEAT + '.tmp'
     with open(tmp, 'w') as f:
-        json.dump({'t': time.time(), 'armed': who, 'problem': problem, 'feed': feed_snapshot(), 'fills': {'depth': len(his_fills), 'cap': his_fills.maxlen, 'dropped_unjudged': fills_dropped}, 'leaders': sorted(leaders.values()), 'fill_lanes': sorted({str(f.get('leader_lane') or '') for f in list(his_fills) if f.get('leader_lane')}), 'leaders_error': leaders_err}, f)
+        json.dump({'t': time.time(), 'armed': who, 'problem': problem, 'feed': feed_snapshot(), 'fills': {'depth': len(his_fills), 'cap': his_fills.maxlen, 'dropped_unjudged': fills_dropped, 'outcomes_24h': outcomes, 'exact_accounted': accounted, 'exact_accounted_10s': on_time, 'size_mismatches': size_mismatches, 'judged': judged, 'exact_accounted_rate': round(accounted / judged, 4) if judged else None}, 'leaders': sorted(leaders.values()), 'fill_lanes': sorted({str(f.get('leader_lane') or '') for f in list(his_fills) if f.get('leader_lane')}), 'leaders_error': leaders_err}, f)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, HEARTBEAT)
@@ -299,13 +320,14 @@ def _jsonl_events(directory, since_ts, kinds):
 
 def decisions_since(which, since_ts):
     out = []
-    for ts, e in _jsonl_events(BOT_DIR, since_ts, {'fire', 'skip', 'signal_guard_skip'}):
+    for ts, e in _jsonl_events(BOT_DIR, since_ts, {'fire', 'would_fire', 'skip', 'signal_guard_skip'}):
         kind = str(e.get('ev', ''))
-        out.append({'ts': ts, 'kind': kind, 'token': str(e.get('tok', '')), 'condition': str(e.get('condition', '')), 'side': 'BUY' if kind == 'signal_guard_skip' else str(e.get('side', '')).upper(), 'tx': str(e.get('tx', '')).lower(), 'his_order_id': str(e.get('his_order_id', '')), 'size': e.get('his_fill')})
+        out.append({'ts': ts, 'kind': kind, 'token': str(e.get('tok', '')), 'condition': str(e.get('condition', '')), 'side': 'BUY' if kind == 'signal_guard_skip' else str(e.get('side', '')).upper(), 'tx': str(e.get('tx', '')).lower(), 'his_order_id': str(e.get('his_order_id', '')), 'size': e.get('his_fill'), 'order_size': e.get('his_order'), 'why': str(e.get('why', '')), 'lane': str(e.get('lane', ''))})
     return out
 fires_since = decisions_since
 SIZE_MATCH_REL = 0.01
 SIZE_MATCH_ABS = 0.5
+TX_SIZE_MATCH_REL = 0.20
 
 def same_order_size(a, b):
     try:
@@ -318,6 +340,34 @@ def token_matches(a, b):
     return bool(a and b and (a == b or a.startswith(b) or b.endswith(a[-12:])))
 BUY_COVERAGE_TTL_SECS = int(os.environ.get('BUY_COVERAGE_TTL_SECS', str(24 * 60 * 60)))
 
+def exact_decision(fill, decisions):
+    tx = str(fill.get('tx', '')).lower()
+    if not tx:
+        return None
+    identity = [d for d in decisions if d.get('tx') == tx
+                and d.get('side') == str(fill.get('side', '')).upper()
+                and (not fill.get('leader_lane') or d.get('lane') in (None, '', fill.get('leader_lane')))
+                and token_matches(str(fill.get('token', '')), d.get('token', ''))]
+    matches = [d for d in identity if d.get('size') is None or same_order_size(d['size'], fill.get('size', 0))
+               or same_order_size(d.get('order_size'), fill.get('size', 0))]
+    if not matches and len(identity) == 1:
+        if identity[0].get('kind') in ('fire', 'would_fire'):
+            # A unique fire for this transaction did happen, even when the
+            # public activity and decoded partial sizes disagree.
+            matches = identity
+        else:
+            try:
+                a, b = float(identity[0]['size']), float(fill.get('size', 0))
+                if abs(a - b) <= max(SIZE_MATCH_ABS, TX_SIZE_MATCH_REL * max(abs(a), abs(b))):
+                    matches = identity
+            except (KeyError, TypeError, ValueError):
+                pass
+    for kind in ('fire', 'would_fire', 'skip', 'signal_guard_skip'):
+        for d in matches:
+            if (d.get('kind') or 'fire') == kind:
+                return d
+    return None
+
 def fill_is_covered(fill, decisions, grace):
     side = str(fill.get('side', '')).upper()
     token = str(fill.get('token', ''))
@@ -327,6 +377,10 @@ def fill_is_covered(fill, decisions, grace):
     lo = float(fill.get('ts', 0)) - 30
     hi = float(fill.get('ts', 0)) + grace
     fill_size = float(fill.get('size', 0) or 0)
+    if tx:
+        if exact_decision(fill, matching_side):
+            return True
+        matching_side = [d for d in matching_side if not d.get('tx')]
     for decision in matching_side:
         if decision.get('kind') != 'skip':
             continue
@@ -337,8 +391,6 @@ def fill_is_covered(fill, decisions, grace):
         decision_size = decision.get('size')
         if side != 'SELL' and decision_size is not None and (not same_order_size(float(decision_size), fill_size)):
             continue
-        return True
-    if tx and any((decision.get('kind') in (None, 'fire') and decision.get('tx') == tx and token_matches(token, decision.get('token', '')) for decision in matching_side)):
         return True
     if side == 'BUY':
         oldest = float(fill.get('ts', 0)) - BUY_COVERAGE_TTL_SECS
@@ -596,7 +648,12 @@ def ws_listen():
                 _feed_set(last_leader_fill_t=time.time())
                 with lock:
                     _note_fill_eviction()
-                    his_fills.append({'ts': time.time(), 'token': str(p.get('asset', '')), 'side': p.get('side'), 'size': float(p.get('size', 0)), 'condition': str(p.get('conditionId', '')), 'tx': str(p.get('transactionHash', '')), 'leader_lane': who_lane, 'title': (p.get('title') or '')[:44], 'seen': False})
+                    fill = {'ts': time.time(), 'token': str(p.get('asset', '')), 'side': str(p.get('side', '')).upper(), 'size': float(p.get('size', 0)), 'condition': str(p.get('conditionId', '')), 'tx': str(p.get('transactionHash', '')).lower(), 'leader_lane': who_lane, 'title': (p.get('title') or '')[:44], 'seen': False}
+                    his_fills.append(fill)
+                try:
+                    append_recovery_signal(fill)
+                except OSError as e:
+                    append_alert('CRITICAL', 'RECOVERY-QUEUE', 'cannot persist leader signal: %s' % e, lanes=[who_lane])
         except Exception as e:
             _feed_set(connected=False, connected_since=None, last_error=repr(e)[:200])
             _feed_bump('reconnects')
@@ -692,8 +749,19 @@ def sweep(grace, alert):
         f['seen'] = True
         side = str(f.get('side', '')).upper()
         if side == 'SELL' and holdings is not None and (not any((token_matches(f['token'], token) for token in holdings))):
+            f['outcome'] = 'not_held'
+            continue
+        exact = exact_decision(f, fires)
+        if exact:
+            f['outcome'] = 'skip' if exact.get('kind') in ('skip', 'signal_guard_skip') else (exact.get('kind') or 'fire')
+            f['reason'] = exact.get('why', '')
+            f['decision_lag_secs'] = max(0.0, float(exact.get('ts', 0)) - float(f.get('ts', 0)))
+            if exact.get('size') is not None and not same_order_size(exact['size'], f.get('size', 0)):
+                f['size_mismatch'] = True
+                f['decision_size'] = exact['size']
             continue
         if fill_is_covered(f, fires, grace):
+            f['outcome'] = 'inferred'
             continue
         lane_of = str(f.get('leader_lane') or '')
         if lane_of:
@@ -702,16 +770,19 @@ def sweep(grace, alert):
             known = known_lanes(BOT_DIR)
             buying_was_off = bool(halted) and bool(known) and (known <= halted)
         if side == 'BUY' and buying_was_off:
+            f['outcome'] = 'halted'
             alert('INFO', 'MISS-SUPPRESSED', f"his BUY {f['size']:,.0f} in {f['title']} not copied — {lane_of or 'every lane'} is HALTED. Expected while stopped; clear the halt to resume buying.")
             continue
         if side == 'SELL':
             _tok = f['token']
             _v, _why = corroborate.check('stranded', {'token': _tok, 'lane': lane_of or who}, corroborate.Ctx(our_positions=lambda: None, leader_positions=lambda _a: None, position_value=lambda t: position_value(lane_of or who, t), our_shares=_held_shares))
             if not corroborate.halts(_v):
+                f['outcome'] = 'refuted'
                 alert('INFO', 'MISS-REFUTED', f"his SELL in {f['title']} not mirrored — {_why}")
                 continue
             if _v != corroborate.CONFIRMED:
                 print('%s [WARN] MISS halting without corroboration: %s' % (time.strftime('%H:%M:%S'), _why), flush=True)
+        f['outcome'] = 'miss'
         alert('CRITICAL', 'MISS', f"his {f['side']} {f['size']:,.0f} in {f['title']} — {who} did NOT fire within {grace}s", lanes=[f.get('leader_lane')] if f.get('leader_lane') else None)
 
 def main():
