@@ -4,6 +4,7 @@ Description=Abomination81 Copybot — guardian every 11 seconds
 
 [Timer]
 OnBootSec=30s
+OnActiveSec=1s
 OnUnitActiveSec=11s
 AccuracySec=1s
 Persistent=true
