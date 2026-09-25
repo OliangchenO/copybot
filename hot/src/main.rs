@@ -2734,9 +2734,10 @@ still be holding something, check that the funder address is right."
         let faults = control.lock().unwrap().boot_faults.clone();
         if !faults.is_empty() {
             for (lane, reason) in faults {
-                eprintln!("[boot] REFUSING LIVE EXECUTION for {lane}: {reason}");
+                eprintln!("[boot] LIVE EXECUTION DISABLED for {lane}: {reason}");
             }
-            std::process::exit(2);
+            // Keep the dashboard available so the operator can inspect the fault.
+            // Boot-faulted lanes remain disarmed in Control::tick_with.
         }
     }
     if shadow {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Completeness {
     Complete,
@@ -27,8 +27,8 @@ pub struct Positions {
     pub completeness: Completeness,
     pub as_of: i64,
 }
-pub const PAGE: usize = 500;
-pub const MAX_PAGES: usize = 50;
+pub const PAGE: usize = 1000;
+pub const MAX_PAGES: usize = 80;
 impl Positions {
     /// A malformed balance row cannot establish that any token is absent.
     pub fn confirms_zero(&self, token: &str, not_before: i64) -> bool {
@@ -80,45 +80,54 @@ impl Positions {
         self.rows.is_empty()
     }
 }
-pub fn page_url(
-    base: &str,
-    user: &str,
-    size_threshold: &str,
-    offset: usize,
-    extra: &str,
-) -> String {
-    format!(
-        "{base}/positions?user={user}&sizeThreshold={size_threshold}\
-             &limit={PAGE}&offset={offset}{extra}"
-    )
+#[derive(serde::Deserialize)]
+struct V2Page {
+    data: Vec<serde_json::Value>,
+    pagination: V2Pagination,
 }
-pub fn judge(
-    page_lens: &[usize],
-    failed_at: Option<(usize, String)>,
-    cap: usize,
-) -> Completeness {
-    if let Some((idx, why)) = failed_at {
-        return Completeness::Failed {
-            after_pages: idx,
-            why,
-        };
+#[derive(serde::Deserialize)]
+struct V2Pagination {
+    has_more: bool,
+    next_cursor: Option<String>,
+}
+fn adapt_v2_row(mut row: serde_json::Value, user: &str) -> Result<serde_json::Value, String> {
+    let obj = row.as_object_mut().ok_or("position row is not an object")?;
+    if !obj.get("proxy_wallet").and_then(|v| v.as_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case(user))
+    {
+        return Err("position wallet does not match requested user".into());
     }
-    match page_lens.last() {
-        Some(&n) if n < PAGE => Completeness::Complete,
-        None => Completeness::Complete,
-        Some(_) if page_lens.len() >= cap => {
-            Completeness::Truncated {
-                pages: page_lens.len(),
-                cap,
-            }
-        }
-        Some(_) => {
-            Completeness::Truncated {
-                pages: page_lens.len(),
-                cap,
-            }
+    if !obj.get("token_id").and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty()) {
+        return Err("position has no token_id".into());
+    }
+    let size = obj.get("current_size")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .ok_or("position has no current_size")?;
+    if !size.is_finite() || size < 0.0 {
+        return Err("position has invalid current_size".into());
+    }
+    // Keep the v2 fields and expose the v1 names used by existing consumers.
+    for (from, to) in [
+        ("proxy_wallet", "proxyWallet"), ("token_id", "asset"),
+        ("condition_id", "conditionId"), ("current_size", "size"),
+        ("avg_price", "avgPrice"), ("entry_cost_usdc", "initialValue"),
+        ("total_cost_usdc", "grossInitialValue"),
+        ("entry_fees_usdc", "entryFeesUsdc"),
+        ("current_value", "currentValue"), ("unrealized_pnl", "cashPnl"),
+        ("percent_pnl", "percentPnl"), ("total_size", "totalBought"),
+        ("realized_pnl", "realizedPnl"),
+        ("percent_realized_pnl", "percentRealizedPnl"),
+        ("current_price", "curPrice"), ("event_slug", "eventSlug"),
+        ("outcome_index", "outcomeIndex"),
+        ("opposite_outcome", "oppositeOutcome"),
+        ("opposite_token_id", "oppositeAsset"),
+        ("end_date", "endDate"), ("negative_risk", "negativeRisk"),
+    ] {
+        if let Some(value) = obj.get(from).cloned() {
+            obj.insert(to.into(), value);
         }
     }
+    Ok(row)
 }
 #[cfg(test)]
 mod tests {
@@ -127,25 +136,17 @@ mod tests {
         serde_json::json!({ "asset" : asset, "size" : size })
     }
     #[test]
-    fn a_SHORT_final_page_proves_completeness() {
-        assert_eq!(judge(& [500, 500, 12], None, MAX_PAGES), Completeness::Complete);
-        assert_eq!(judge(& [3], None, MAX_PAGES), Completeness::Complete);
-        assert_eq!(judge(& [0], None, MAX_PAGES), Completeness::Complete);
-        assert_eq!(judge(& [], None, MAX_PAGES), Completeness::Complete);
-    }
-    #[test]
-    fn a_FULL_final_page_at_the_budget_is_TRUNCATED() {
-        let lens = vec![500usize; MAX_PAGES];
-        assert!(
-            matches!(judge(& lens, None, MAX_PAGES), Completeness::Truncated { .. })
-        );
-    }
-    #[test]
-    fn a_FAILED_page_is_never_COMPLETE_however_much_we_got() {
-        let c = judge(&[500, 500], Some((2, "503".into())), MAX_PAGES);
-        assert!(! c.is_complete());
-        assert!(c.reason().contains("page 3 failed"));
-        assert!(! judge(& [7], Some((1, "timeout".into())), MAX_PAGES).is_complete());
+    fn v2_row_maps_the_balance_fields_and_rejects_wrong_wallet() {
+        let raw = serde_json::json!({
+            "proxy_wallet": "0xabc", "token_id": "T", "current_size": 2.5,
+            "current_price": 0.6, "redeemable": true
+        });
+        let row = adapt_v2_row(raw.clone(), "0xAbC").unwrap();
+        assert_eq!(row["asset"], "T");
+        assert_eq!(row["size"], 2.5);
+        assert_eq!(row["curPrice"], 0.6);
+        assert_eq!(row["redeemable"], true);
+        assert!(adapt_v2_row(raw, "0xdef").is_err());
     }
     #[test]
     fn DESTRUCTIVE_action_is_refused_on_anything_but_a_complete_read() {
@@ -179,13 +180,6 @@ mod tests {
         assert!((m["U"] - 3.25).abs() < 1e-9);
         assert_eq!(m.len(), 2, "a row with no asset is skipped, not fatal");
     }
-    #[test]
-    fn page_url_advances_the_offset_and_keeps_extras() {
-        let u = page_url("https://x", "0xabc", "0.0001", 1000, "&redeemable=true");
-        assert!(u.contains("offset=1000"));
-        assert!(u.contains("limit=500"));
-        assert!(u.contains("redeemable=true"));
-    }
 }
 pub async fn fetch(
     http: &reqwest::Client,
@@ -195,36 +189,74 @@ pub async fn fetch(
     extra: &str,
     now: i64,
 ) -> Positions {
+    let include_archived = match extra {
+        "" => "false",
+        "&includeArchived=true" => "true",
+        _ => return Positions {
+            rows: Vec::new(),
+            completeness: Completeness::Failed {
+                after_pages: 0,
+                why: format!("unsupported positions filter: {extra}"),
+            },
+            as_of: now,
+        },
+    };
     let mut rows = Vec::new();
-    let mut lens = Vec::new();
-    let mut failed = None;
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut seen_tokens = HashSet::new();
+    let mut completeness = Completeness::Truncated { pages: MAX_PAGES, cap: MAX_PAGES };
     for page in 0..MAX_PAGES {
-        let url = page_url(base, user, size_threshold, page * PAGE, extra);
-        let got = match http.get(&url).send().await {
+        let mut request = http.get(format!("{base}/v2/positions")).query(&[
+            ("user", user), ("limit", "1000"), ("filter_type", "TOKENS"),
+            ("filter_amount", size_threshold), ("sort_by", "TOKENS"),
+            ("include_archived", include_archived),
+        ]);
+        if let Some(value) = &cursor {
+            request = request.query(&[("cursor", value)]);
+        }
+        let got = match request.send().await {
             Ok(r) if r.status().is_success() => {
-                r.json::<Vec<serde_json::Value>>()
+                r.json::<V2Page>()
                     .await
                     .map_err(|e| format!("decode: {e}"))
             }
             Ok(r) => Err(format!("http {}", r.status().as_u16())),
             Err(e) => Err(format!("transport: {e}")),
         };
-        match got {
-            Ok(batch) => {
-                let n = batch.len();
-                rows.extend(batch);
-                lens.push(n);
-                if n < PAGE {
-                    break;
+        let result = got.and_then(|batch| {
+            if batch.data.len() > PAGE || (batch.pagination.has_more && batch.data.is_empty()) {
+                return Err("invalid page size".into());
+            }
+            for raw in batch.data {
+                let row = adapt_v2_row(raw, user)?;
+                let token = row["asset"].as_str().unwrap();
+                if !seen_tokens.insert(token.to_owned()) {
+                    return Err(format!("duplicate token in positions: {token}"));
                 }
+                rows.push(row);
             }
-            Err(why) => {
-                failed = Some((page, why));
-                break;
+            if batch.pagination.has_more {
+                let next = batch.pagination.next_cursor
+                    .filter(|s| !s.is_empty())
+                    .ok_or("has_more without next_cursor")?;
+                if !seen_cursors.insert(next.clone()) {
+                    return Err("repeated positions cursor".into());
+                }
+                cursor = Some(next);
+            } else {
+                completeness = Completeness::Complete;
             }
+            Ok(())
+        });
+        if let Err(why) = result {
+            completeness = Completeness::Failed { after_pages: page, why };
+            break;
+        }
+        if completeness.is_complete() {
+            break;
         }
     }
-    let completeness = judge(&lens, failed, MAX_PAGES);
     Positions {
         rows,
         completeness,
