@@ -23,9 +23,72 @@ else
   systemctl_cmd=(sudo systemctl)
 fi
 
+check_start_config() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  [[ -x "$script_dir/../hot/target/release/copybot-hot" ]] || {
+    echo "copybot binary is missing; run: $0 build" >&2
+    return 1
+  }
+  python3 - "$script_dir/copybot2.toml" "$script_dir/copybot.env" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+config = tomllib.loads(Path(sys.argv[1]).read_text())
+if config.get("bot", {}).get("mode") != "live":
+    sys.exit("CONFIG ERROR: bot.mode must be live")
+
+env = {}
+for line in Path(sys.argv[2]).read_text().splitlines():
+    if "=" in line and not line.lstrip().startswith("#"):
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip().strip("\"'")
+
+names = set()
+for feed in config.get("feed", []):
+    name = feed["name"]
+    if name in names:
+        sys.exit(f"CONFIG ERROR: duplicate feed name {name}")
+    names.add(name)
+    url, url_env = feed.get("url", ""), feed.get("url_env")
+    if bool(url) == bool(url_env):
+        sys.exit(f"CONFIG ERROR: feed {name}: set exactly one of url or url_env")
+    if url_env:
+        url = env.get(url_env, "")
+    if not url.startswith("wss://"):
+        sys.exit(f"CONFIG ERROR: feed {name}: expected a wss:// URL ({url_env or 'url'})")
+PY
+}
+
 start_services() {
   "${systemctl_cmd[@]}" enable --now "$engine" "$watcher"
   "${systemctl_cmd[@]}" enable --now "${timers[@]}"
+  local engine_pid last_pid=0 stable_since=0 deadline=$((SECONDS + 90))
+  while (( SECONDS < deadline )); do
+    engine_pid=$(systemctl show "$engine" --property=MainPID --value)
+    if [[ "$engine_pid" != 0 ]] && systemctl is-active --quiet "$engine"; then
+      if [[ "$engine_pid" != "$last_pid" ]]; then
+        last_pid="$engine_pid"
+        stable_since=$SECONDS
+      elif (( SECONDS - stable_since >= 20 )); then
+        break
+      fi
+    else
+      last_pid=0
+    fi
+    sleep 2
+  done
+  if [[ "$last_pid" == 0 || "$last_pid" != "$(systemctl show "$engine" --property=MainPID --value)" ]] || (( SECONDS - stable_since < 20 )); then
+    echo "copybot engine did not stay running for 20 seconds; inspect: sudo journalctl -u $engine -n 30" >&2
+    return 1
+  fi
+  for unit in "${units[@]}"; do
+    if ! systemctl is-active --quiet "$unit"; then
+      echo "$unit is not active after start; inspect: sudo journalctl -u $unit -n 30" >&2
+      return 1
+    fi
+  done
 }
 
 stop_services() {
@@ -57,19 +120,21 @@ case "$action" in
     cargo build --locked --release --manifest-path "$script_dir/../hot/Cargo.toml" --bin copybot-hot
     ;;
   start)
+    check_start_config
     start_services
     ;;
   stop)
     stop_services
     ;;
   restart)
+    check_start_config
     stop_services
     start_services
     ;;
   status)
     for unit in "${units[@]}"; do
-      enabled=$("${systemctl_cmd[@]}" is-enabled "$unit" 2>/dev/null || true)
-      if "${systemctl_cmd[@]}" is-active --quiet "$unit"; then
+      enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+      if systemctl is-active --quiet "$unit"; then
         printf '%-32s active   %s\n' "$unit" "$enabled"
       else
         printf '%-32s inactive %s\n' "$unit" "$enabled"

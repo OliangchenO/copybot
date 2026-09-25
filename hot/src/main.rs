@@ -1383,6 +1383,7 @@ async fn submit_tracked(
     String,
 > {
     use copybot_hot::race_send::Outcome;
+    let submit_started = std::time::Instant::now();
     let hash = order_hash.clone();
     let p = copybot_hot::pending::Pending {
         lane: prov.lane.clone(),
@@ -1412,9 +1413,14 @@ async fn submit_tracked(
             .saturating_sub(8)..], prov.held_before
         );
     }
-    if !already_durable {
+    let persist_started = std::time::Instant::now();
+    let persist_us = if !already_durable {
         pend.lock().unwrap().record(p)?;
-    }
+        Some(persist_started.elapsed().as_micros() as u64)
+    } else {
+        None
+    };
+    let race_started = std::time::Instant::now();
     let (outcome, results) = copybot_hot::race_send::race_submit(
             paths,
             url,
@@ -1423,6 +1429,12 @@ async fn submit_tracked(
             timeout,
         )
         .await;
+    let race_ms = race_started.elapsed().as_micros() as f64 / 1000.0;
+    let total_ms = submit_started.elapsed().as_micros() as f64 / 1000.0;
+    let path_ms: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| serde_json::json!({ "path": r.path, "http": r.http, "ms": r.ms }))
+        .collect();
     match &outcome {
         Outcome::Rejected { .. } => {
             pend.lock().unwrap().resolve(&hash, "rejected", None);
@@ -1434,7 +1446,8 @@ async fn submit_tracked(
             { "t" : now_ms(), "ev" : "order_result", "origin" : prov.origin.kind(),
             "lane" : prov.lane, "tok" : prov.token, "side" : if prov.side == 1 { "SELL" }
             else { "BUY" }, "order_hash" : hash, "outcome" : format!("{outcome:?}"),
-            "paths" : results.len(), }
+            "paths" : results.len(), "persist_us" : persist_us, "race_ms" : race_ms,
+            "total_ms" : total_ms, "path_ms" : path_ms, }
         ),
     );
     Ok((outcome, results))
@@ -4210,6 +4223,23 @@ declared net external funding (deposits - withdrawals); independent of lane allo
     );
     let order_paths = Arc::new(order_paths);
     let clob = root.bot.clob_host.clone();
+    for (_, client) in order_paths.iter() {
+        let client = client.clone();
+        let url = format!("{}/time", clob.trim_end_matches('/'));
+        tokio::spawn(async move {
+            loop {
+                if let Ok(Ok(resp)) = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        client.get(&url).send(),
+                    )
+                    .await
+                {
+                    let _ = resp.bytes().await;
+                }
+                tokio::time::sleep(Duration::from_secs(45)).await;
+            }
+        });
+    }
     let creds: Arc<Option<copybot_hot::auth::ApiCreds>> = if shadow {
         eprintln!(
             "[auth] SHADOW — credentials deliberately NOT derived. Every order \

@@ -40,7 +40,7 @@ def our_decisions(window_secs, now):
                     e = json.loads(line)
                 except Exception:
                     continue
-                if e.get('ev') not in ('fire', 'skip', 'signal_guard_skip'):
+                if e.get('ev') not in ('fire', 'skip', 'signal_guard_skip', 'recovery_refused'):
                     continue
                 t = (e.get('t') or 0) / 1000.0
                 if now - t > window_secs + JOIN_SECS + 600:
@@ -53,7 +53,7 @@ def classify(buy, lane, decisions):
     if any((e.get('ev') == 'fire' and str(e.get('side')).upper() == 'BUY' for _, e in near)):
         return 'FIRED'
     for _, e in near:
-        if e.get('ev') in ('skip', 'signal_guard_skip'):
+        if e.get('ev') in ('skip', 'signal_guard_skip', 'recovery_refused'):
             why = str(e.get('why') or 'skip')
             return 'DECLINED:' + why.split('{')[0].split('(')[0].strip()
     if near:

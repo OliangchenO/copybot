@@ -289,37 +289,35 @@ async fn pump(
     ws.send(Message::Text(sub.to_string()))
         .await
         .map_err(|e| format!("subscribe send: {e}"))?;
-    match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
-        Ok(Some(Ok(Message::Text(t)))) => {
-            if t.contains("\"error\"") {
-                return Err(
-                    format!("subscription rejected: {}", & t[..t.len().min(120)]),
-                );
-            }
-        }
-        Ok(Some(Ok(_))) => {}
+    let mut first = match tokio::time::timeout(PROVE_TIMEOUT, ws.next()).await {
+        Ok(Some(Ok(m))) => Some(m),
         Ok(Some(Err(e))) => return Err(format!("ack: {e}")),
         Ok(None) => return Err("closed before ack".into()),
-        Err(_) => return Err("ack timeout".into()),
-    }
+        Err(_) => return Err("subscription delivered NOTHING — black hole".into()),
+    };
     let mut proved = false;
     loop {
-        let next = tokio::time::timeout(
-                if proved { Duration::from_secs(90) } else { PROVE_TIMEOUT },
-                ws.next(),
-            )
-            .await;
         if stats.take_recycle() {
             return Ok(());
         }
-        let msg = match next {
-            Err(_) if !proved => {
-                return Err("subscribed but delivered NOTHING — black hole".into());
+        let msg = match first.take() {
+            Some(m) => m,
+            None => {
+                let next = tokio::time::timeout(
+                        if proved { Duration::from_secs(90) } else { PROVE_TIMEOUT },
+                        ws.next(),
+                    )
+                    .await;
+                match next {
+                    Err(_) if !proved => {
+                        return Err("subscribed but delivered NOTHING — black hole".into());
+                    }
+                    Err(_) => return Err("silent past 90s".into()),
+                    Ok(None) => return Ok(()),
+                    Ok(Some(Err(e))) => return Err(format!("recv: {e}")),
+                    Ok(Some(Ok(m))) => m,
+                }
             }
-            Err(_) => return Err("silent past 90s".into()),
-            Ok(None) => return Ok(()),
-            Ok(Some(Err(e))) => return Err(format!("recv: {e}")),
-            Ok(Some(Ok(m))) => m,
         };
         let raw = match msg {
             Message::Text(t) => t,
@@ -333,6 +331,12 @@ async fn pump(
             Message::Close(_) => return Ok(()),
             _ => continue,
         };
+        if raw.contains("\"error\"") {
+            return Err(format!("subscription rejected: {}", &raw[..raw.len().min(120)]));
+        }
+        if raw.contains("\"id\":1") && !raw.contains("\"method\":\"eth_subscription\"") {
+            continue;
+        }
         proved = true;
         stats.frame();
         frames_since_watch_refresh += 1;
