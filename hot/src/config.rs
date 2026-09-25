@@ -6,6 +6,101 @@ pub struct Root {
     #[serde(default)]
     pub feed: Vec<Feed>,
     pub lane: Vec<LaneToml>,
+    #[serde(default)]
+    pub consensus: Option<ConsensusToml>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ConsensusToml {
+    pub enabled: bool,
+    pub primary_lane: String,
+    pub confirm_wallet: String,
+    pub veto_wallet: String,
+    pub symbols: Vec<String>,
+    pub interval_minutes: u64,
+    pub min_purity: f64,
+    pub min_primary_directional_usd: f64,
+    pub min_buy_price: f64,
+    pub max_buy_price: f64,
+    pub two_wallet_target_usd: f64,
+    pub three_wallet_target_usd: f64,
+    pub confirm_window_seconds: i64,
+    pub min_remaining_seconds: i64,
+    pub max_state_age_seconds: i64,
+    pub events_path: String,
+    pub rpc_env: Option<String>,
+}
+
+impl Default for ConsensusToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            primary_lane: String::new(),
+            confirm_wallet: crate::consensus::STD0.into(),
+            veto_wallet: crate::consensus::ANTS.into(),
+            symbols: vec!["BTC".into(), "ETH".into()],
+            interval_minutes: 5,
+            min_purity: 0.60,
+            min_primary_directional_usd: 10.0,
+            min_buy_price: 0.20,
+            max_buy_price: 0.70,
+            two_wallet_target_usd: 5.0,
+            three_wallet_target_usd: 10.0,
+            confirm_window_seconds: 20,
+            min_remaining_seconds: 60,
+            max_state_age_seconds: 10,
+            events_path: "data/consensus-events.jsonl".into(),
+            rpc_env: None,
+        }
+    }
+}
+
+impl ConsensusToml {
+    pub fn validate(&self, root: &Root) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if root.bot.mode != "dry" {
+            return Err("consensus V1 is simulation-only: bot.mode must be dry".into());
+        }
+        let primary = root.lane.iter().find(|l| l.enabled && l.name == self.primary_lane)
+            .ok_or("consensus primary_lane must name one enabled lane")?;
+        let ohio = addr20(crate::consensus::OHIO)?;
+        let std0 = addr20(&self.confirm_wallet)?;
+        let ants = addr20(&self.veto_wallet)?;
+        if addr20(&primary.wallet)? != ohio || std0 != addr20(crate::consensus::STD0)?
+            || ants != addr20(crate::consensus::ANTS)? || ohio == std0 || ohio == ants || std0 == ants
+        {
+            return Err("consensus role wallet addresses do not match the verified identities".into());
+        }
+        if self.interval_minutes != 5 || self.symbols.is_empty()
+            || self.symbols.iter().any(|s| s != "BTC" && s != "ETH")
+            || !(self.min_purity.is_finite() && self.min_purity > 0.0 && self.min_purity <= 1.0)
+            || !(self.min_primary_directional_usd.is_finite() && self.min_primary_directional_usd > 0.0)
+            || !(self.min_buy_price.is_finite() && self.max_buy_price.is_finite()
+                && 0.0 < self.min_buy_price && self.min_buy_price < self.max_buy_price
+                && self.max_buy_price < 1.0)
+            || !(self.two_wallet_target_usd.is_finite() && self.two_wallet_target_usd > 0.0
+                && self.three_wallet_target_usd.is_finite()
+                && self.three_wallet_target_usd >= self.two_wallet_target_usd)
+            || self.confirm_window_seconds <= 0 || self.min_remaining_seconds <= 0
+            || self.max_state_age_seconds <= 0 || self.events_path.is_empty()
+            || self.rpc_env.as_ref().is_some_and(|s| s.is_empty())
+        {
+            return Err("consensus parameters are invalid".into());
+        }
+        let (caps, _) = resolve_caps(primary)?;
+        if caps.per_market_usd + 1e-9 < self.three_wallet_target_usd {
+            return Err("consensus target exceeds the primary lane per-market budget".into());
+        }
+        if primary.budget.min_buy_price > self.min_buy_price
+            || primary.budget.max_buy_price < self.max_buy_price
+        {
+            return Err("consensus lane buy band or exit policy conflicts with consensus rules".into());
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Deserialize)]
 pub struct Bot {
@@ -576,6 +671,16 @@ impl Root {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn consensus_example_parses_and_live_mode_is_rejected() {
+        let text = include_str!("../../deploy/copybot-consensus.example.toml");
+        let mut root: Root = toml::from_str(text).expect("consensus example TOML");
+        let cfg = root.consensus.as_ref().unwrap();
+        cfg.validate(&root).expect("dry consensus example");
+        root.bot.mode = "live".into();
+        assert!(root.consensus.as_ref().unwrap().validate(&root).is_err());
+    }
 
     fn bankroll_root() -> Root {
         toml::from_str(

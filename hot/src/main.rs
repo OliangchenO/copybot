@@ -597,25 +597,11 @@ async fn seed_pair_ledger(
     leader: &str,
     ledger: &std::sync::Mutex<copybot_hot::pairledger::PairLedger>,
 ) -> Result<(usize, usize), String> {
-    let mut all: Vec<serde_json::Value> = Vec::new();
-    for offset in (0..4000).step_by(500) {
-        let url = format!(
-            "https://data-api.polymarket.com/activity?\
-user={leader}&limit=500&offset={offset}"
-        );
-        let rows: Vec<serde_json::Value> = match http.get(&url).send().await {
-            Ok(r) if r.status().is_success() => {
-                r.json().await.map_err(|e| e.to_string())?
-            }
-            Ok(r) => return Err(format!("activity HTTP {}", r.status())),
-            Err(e) => return Err(e.to_string()),
-        };
-        let n = rows.len();
-        all.extend(rows);
-        if n < 500 {
-            break;
-        }
-    }
+    let rows = copybot_hot::data_api_v2::fetch_all(http,
+        copybot_hot::data_api_v2::BASE, "/v2/activity", &[("user", leader)]).await?;
+    let all: Vec<serde_json::Value> = rows.iter()
+        .map(copybot_hot::data_api_v2::legacy_activity)
+        .collect::<Result<_, _>>()?;
     let seeds = copybot_hot::pairledger::seed_rows_from_activity(&all);
     let n = seeds.len();
     let mut g = ledger.lock().map_err(|_| "pair ledger lock poisoned".to_string())?;
@@ -1765,6 +1751,13 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let consensus_cfg = root.consensus.as_ref().filter(|c| c.enabled).cloned();
+    if let Some(cfg) = &consensus_cfg {
+        if let Err(e) = cfg.validate(&root) {
+            eprintln!("CONFIG ERROR: {e}");
+            std::process::exit(2);
+        }
+    }
     let shadow = root.bot.mode == "shadow";
     let live = root.bot.mode == "live" || shadow;
     let funder = root.bot.funder.clone();
@@ -1992,6 +1985,10 @@ actually reach the venue and are refused. This key controls no funds."
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<RawTx>();
     let watched_addrs = Arc::new(copybot_hot::feeds::WatchedAddresses::new());
+    if let Some(cfg) = &consensus_cfg {
+        watched_addrs.set([copybot_hot::consensus::OHIO.to_string(),
+            cfg.confirm_wallet.clone(), cfg.veto_wallet.clone()]);
+    }
     let (_handles, feed_registry) = copybot_hot::feeds::spawn_all(
         &feeds,
         tx.clone(),
@@ -2060,6 +2057,15 @@ actually reach the venue and are refused. This key controls no funds."
         &wallets_path,
         root.wallet_specs(),
     );
+    if let Some(cfg) = &consensus_cfg {
+        if !registry.specs().iter().any(|s| s.name == cfg.primary_lane
+            && copybot_hot::config::addr20(&s.leader).ok()
+                == copybot_hot::config::addr20(copybot_hot::consensus::OHIO).ok())
+        {
+            eprintln!("CONFIG ERROR: persisted consensus lane address differs from Ohio");
+            std::process::exit(2);
+        }
+    }
     match registry.mint_missing_ids() {
         Ok(0) => {}
         Ok(n) => {
@@ -2940,44 +2946,24 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                 title_cache.clone(),
             );
             tokio::spawn(async move {
-                const PAGE: usize = 500;
-                const MAX_PAGES: usize = 20;
                 let mut tick = tokio::time::interval(Duration::from_secs(300));
                 loop {
                     tick.tick().await;
                     let mut scanned = 0usize;
-                    for page in 0..MAX_PAGES {
-                        let url = format!(
-                            "https://data-api.polymarket.com/trades?user={funder_t}\
-                             &limit={PAGE}&offset={}",
-                            page * PAGE
-                        );
-                        let rows: Vec<serde_json::Value> = match http_t
-                            .get(&url)
-                            .send()
-                            .await
-                        {
-                            Ok(r) if r.status().is_success() => {
-                                r.json().await.unwrap_or_default()
-                            }
-                            _ => break,
-                        };
-                        let n = rows.len();
-                        if n > 0 {
+                    if let Ok(rows) = copybot_hot::data_api_v2::fetch_all(&http_t,
+                        copybot_hot::data_api_v2::BASE, "/v2/trades", &[("user", &funder_t)]).await {
+                        scanned = rows.len();
+                        if scanned > 0 {
                             let mut w = cache_t.write().unwrap();
                             for row in &rows {
                                 if let (Some(tok), Some(title)) = (
-                                    row["asset"].as_str(),
+                                    row["token_id"].as_str(),
                                     row["title"].as_str(),
                                 ) {
                                     w.entry(tok.to_string())
                                         .or_insert_with(|| title.to_string());
                                 }
                             }
-                        }
-                        scanned += n;
-                        if n < PAGE {
-                            break;
                         }
                     }
                     eprintln!(
@@ -4537,16 +4523,11 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
                 };
                 let Some(cr) = creds3.as_ref() else { continue };
                 let Some(key) = pk3.as_ref() else { continue };
-                let url = format!(
-                    "https://data-api.polymarket.com/positions?user={f3}\
-&sizeThreshold=0.0001&limit=500"
-                );
-                let Ok(resp) = http.get(&url).send().await else { continue };
-                if !resp.status().is_success() {
-                    continue;
-                }
-                let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
-                let Some(ours) = v.as_array() else { continue };
+                let ours_snap = copybot_hot::positions::fetch(&http,
+                    "https://data-api.polymarket.com", &f3, "0.0001", "",
+                    copybot_hot::ledger::now_secs()).await;
+                if !ours_snap.may_act_destructively() { continue; }
+                let ours = &ours_snap.rows;
                 for lane in r3.snapshot().iter() {
                     let name = lane.cfg.name.clone();
                     if !lane.state.armed.load(Ordering::Relaxed) {
@@ -4560,18 +4541,11 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
                         continue;
                     }
                     let leader = format!("0x{}", hex::encode(lane.cfg.wallet20));
-                    let his_url = format!(
-                        "https://data-api.polymarket.com/positions?user={leader}\
-&sizeThreshold=0.0001&limit=500"
-                    );
-                    let his = match http.get(&his_url).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            match resp.json::<serde_json::Value>().await {
-                                Ok(rows) => {
-                                    rows.as_array()
-                                        .map(|a| {
-                                            a
-                                                .iter()
+                    let his_snap = copybot_hot::positions::fetch(&http,
+                        "https://data-api.polymarket.com", &leader, "0.0001", "",
+                        copybot_hot::ledger::now_secs()).await;
+                    let his = if his_snap.may_act_destructively() {
+                        Some(his_snap.rows.iter()
                                                 .filter_map(|p| {
                                                     let token = p["asset"].as_str()?.to_string();
                                                     let size = p["size"]
@@ -4586,14 +4560,8 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
                                                         .unwrap_or(0.0);
                                                     Some((token, (size, avg)))
                                                 })
-                                                .collect::<std::collections::HashMap<_, _>>()
-                                        })
-                                }
-                                Err(_) => None,
-                            }
-                        }
-                        _ => None,
-                    };
+                                                .collect::<std::collections::HashMap<_, _>>())
+                    } else { None };
                     let Some(his) = his else {
                         e3.emit(
                             serde_json::json!(
@@ -5005,16 +4973,11 @@ SOLD — the wallet still holds everything it held before.",
                 let (Some(cr), Some(key)) = (creds4.as_ref(), pk4.as_ref()) else {
                     continue
                 };
-                let url = format!(
-                    "https://data-api.polymarket.com/positions?user={f4}\
-&sizeThreshold=0.0001&limit=500"
-                );
-                let ours: Vec<serde_json::Value> = match http.get(&url).send().await {
-                    Ok(r) if r.status().is_success() => {
-                        r.json().await.unwrap_or_default()
-                    }
-                    _ => Vec::new(),
-                };
+                let ours_snap = copybot_hot::positions::fetch(&http,
+                    "https://data-api.polymarket.com", &f4, "0.0001", "",
+                    copybot_hot::ledger::now_secs()).await;
+                if !ours_snap.may_act_destructively() { continue; }
+                let ours = ours_snap.rows;
                 let mark_of = |tok: &str| -> f64 {
                     ours.iter()
                         .find(|p| p["asset"].as_str() == Some(tok))
@@ -6789,16 +6752,11 @@ this as a bad read, not a mass cancellation",
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                let url = format!(
-                    "https://data-api.polymarket.com/positions?user={fund}\
-&sizeThreshold=0.0001&limit=500&redeemable=true"
-                );
-                let rows: Vec<serde_json::Value> = match http.get(&url).send().await {
-                    Ok(r) if r.status().is_success() => {
-                        r.json().await.unwrap_or_default()
-                    }
-                    _ => continue,
-                };
+                let snapshot = copybot_hot::positions::fetch(&http,
+                    "https://data-api.polymarket.com", &fund, "0.0001", "&redeemable=true",
+                    copybot_hot::ledger::now_secs()).await;
+                if !snapshot.may_act_destructively() { continue; }
+                let rows = snapshot.rows;
                 let mut payout: std::collections::HashMap<String, f64> = Default::default();
                 for p in &rows {
                     let view = copybot_hot::settlement::PositionView {
@@ -7481,23 +7439,20 @@ and its age is real"
                     continue;
                 }
                 let mut set = std::collections::HashSet::new();
+                let mut complete = true;
                 for leader in leaders {
-                    let url = format!(
-                        "https://data-api.polymarket.com/activity?\
-user={leader}&limit=500"
-                    );
-                    let rows: Vec<serde_json::Value> = match hc.get(&url).send().await {
-                        Ok(r) if r.status().is_success() => {
-                            r.json().await.unwrap_or_default()
-                        }
-                        _ => continue,
+                    let rows = match copybot_hot::data_api_v2::fetch_all(&hc,
+                        copybot_hot::data_api_v2::BASE, "/v2/activity", &[("user", &leader)]).await {
+                        Ok(rows) => rows,
+                        Err(e) => { eprintln!("[politics] activity unavailable: {e}");
+                            complete = false; break; },
                     };
                     for r in &rows {
                         let ty = r["type"].as_str().unwrap_or("");
                         let political = ty == "SPLIT" || ty == "MERGE"
                             || is_political_title(r["title"].as_str().unwrap_or(""));
                         if political {
-                            if let Some(cid) = r["conditionId"]
+                            if let Some(cid) = r["condition_id"]
                                 .as_str()
                                 .and_then(copybot_hot::merge::condition_id_bytes)
                             {
@@ -7506,6 +7461,7 @@ user={leader}&limit=500"
                         }
                     }
                 }
+                if !complete { continue; }
                 let n = set.len();
                 if let Ok(mut g) = pol.write() {
                     *g = set;
@@ -7514,6 +7470,36 @@ user={leader}&limit=500"
             }
         });
     }
+    let (consensus_tx, consensus_roles) = if let Some(cfg) = consensus_cfg.clone() {
+        let lane = router.snapshot().into_iter()
+            .find(|lane| lane.cfg.name == cfg.primary_lane).expect("validated consensus lane");
+        let caps = lane.policy().caps;
+        let cents = |usd: f64| (usd * 100.0).floor() as i64;
+        let limits = copybot_hot::consensus_observer::Limits {
+            daily_cents: cents(caps.daily_usd),
+            max_open_cents: cents(caps.max_open_usd),
+            per_fill_cents: cents(caps.max_usd_per_fill),
+            min_order_cents: cents(lane.cfg.min_order_usd).max(100),
+            buy_slippage_micro: (lane.cfg.buy_slippage_c * 1_000_000.0).round() as i64,
+        };
+        let rpc = cfg.rpc_env.as_ref().map(|name| std::env::var(name)).transpose()
+            .unwrap_or_else(|_| {
+                eprintln!("CONFIG ERROR: consensus RPC environment variable missing");
+                std::process::exit(2);
+            })
+            .unwrap_or_else(|| copybot_hot::txsend::DEFAULT_RPC.into());
+        if !rpc.starts_with("https://") && !rpc.starts_with("http://") {
+            eprintln!("CONFIG ERROR: consensus RPC must be an HTTP URL");
+            std::process::exit(2);
+        }
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let roles = [copybot_hot::consensus::OHIO, copybot_hot::consensus::STD0,
+            copybot_hot::consensus::ANTS].iter().map(|a| addr20(a).unwrap()).collect::<Vec<_>>();
+        tokio::spawn(copybot_hot::consensus_observer::run(
+            cfg, root.bot.clob_host.clone(), rpc, limits, receiver,
+        ));
+        (Some(sender), roles)
+    } else { (None, Vec::new()) };
     let mut tx_seen = copybot_hot::race::SeenTx::new(8192);
     let mut behind = copybot_hot::race::BehindTally::default();
     let mut since_race_report: u64 = 0;
@@ -7667,11 +7653,17 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
         if present.is_empty() {
             continue;
         }
+        if present.iter().any(|p| consensus_roles.contains(p)) {
+            if let Some(sender) = &consensus_tx { let _ = sender.send(raw.clone()); }
+        }
         for lane_ix in 0..router.len() {
             let lane = match router.lane(lane_ix) {
                 Some(l) => l,
                 None => continue,
             };
+            if consensus_cfg.as_ref().is_some_and(|cfg| cfg.primary_lane == lane.cfg.name) {
+                continue;
+            }
             let w20 = lane.cfg.wallet20;
             if !present.iter().any(|p| p == &w20) {
                 continue;

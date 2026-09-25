@@ -55,6 +55,7 @@ import os
 import sys
 import time
 import urllib.request
+import urllib.parse
 HIM = os.environ.get('WATCH_WALLET', '').lower()
 OUR = os.environ.get('OUR_WALLET', '')
 DATA_API = 'https://data-api.polymarket.com'
@@ -114,6 +115,30 @@ def log(msg):
 def http_json(url, headers=None, timeout=20):
     req = urllib.request.Request(url, headers=headers or {'User-Agent': 'guardian'})
     return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+def v2_pages(route, params, max_pages=50):
+    rows, cursor, seen = [], None, set()
+    for _ in range(max_pages):
+        query = dict(params, limit=500)
+        if cursor is not None:
+            query['cursor'] = cursor
+        body = http_json('%s/v2/%s?%s' % (DATA_API, route, urllib.parse.urlencode(query)),
+                         headers={'User-Agent': 'guardian'})
+        if not isinstance(body, dict) or not isinstance(body.get('data'), list):
+            raise ValueError('v2 %s has no data list' % route)
+        pagination = body.get('pagination')
+        if not isinstance(pagination, dict) or not isinstance(pagination.get('has_more'), bool):
+            raise ValueError('v2 %s has no pagination state' % route)
+        cursor = pagination.get('next_cursor')
+        if pagination['has_more'] != (isinstance(cursor, str) and bool(cursor)):
+            raise ValueError('v2 %s has inconsistent cursor' % route)
+        rows.extend(body['data'])
+        if not pagination['has_more']:
+            return rows
+        if cursor in seen:
+            raise ValueError('v2 %s repeated cursor' % route)
+        seen.add(cursor)
+    raise ValueError('v2 %s exceeded %d pages' % (route, max_pages))
 POLYMARKET_STATUS_SUMMARY = 'https://status.polymarket.com/v3/summary.json'
 POLYMARKET_STATUS_COMPONENTS = 'https://status.polymarket.com/v3/components.json'
 VENUE_TRADING_COMPONENTS = ('Trading API (CLOB)', 'Clob Websocket')
@@ -334,7 +359,7 @@ def foreign_writer_check(funder, now, prior, fetch=None, ledger_path=None):
     return (st, warnings)
 
 def _foreign_fetch(funder):
-    return http_json('%s/trades?user=%s&limit=%d' % (DATA_API, funder, FOREIGN_PAGE_LIMIT))
+    return v2_pages('trades', {'user': funder, 'start': int(time.time()) - FOREIGN_WINDOW_SECS})
 
 def reanchor_warnings(pool):
     out = []
@@ -887,24 +912,19 @@ POSITIONS_PAGE = 500
 POSITIONS_MAX_PAGES = 50
 
 def fetch_all_positions(user, page=POSITIONS_PAGE, max_pages=POSITIONS_MAX_PAGES):
-    chain, pages = ({}, [])
-    for i in range(max_pages):
-        url = '%s/positions?user=%s&sizeThreshold=0&limit=%d&offset=%d' % (DATA_API, user, page, i * page)
-        try:
-            rows = http_json(url, headers={'User-Agent': 'guardian'})
-        except Exception as e:
-            return (chain, False, 'page %d failed: %s' % (i + 1, e))
-        if not isinstance(rows, list):
-            return (chain, False, 'page %d was not a list' % (i + 1))
+    try:
+        rows = v2_pages('positions', {'user': user, 'status': 'OPEN',
+            'filter_type': 'TOKENS', 'filter_amount': 0}, max_pages=max_pages)
+        chain = {}
         for p in rows:
-            try:
-                chain[str(p['asset'])] = p
-            except (KeyError, TypeError):
-                continue
-        pages.append(len(rows))
-        if len(rows) < page:
-            return (chain, True, 'complete')
-    return (chain, False, 'truncated at the %d-page budget' % max_pages)
+            if not isinstance(p, dict) or not p.get('token_id') or p.get('current_size') is None:
+                raise ValueError('v2 position has no token or size')
+            p = dict(p, asset=str(p['token_id']), size=p['current_size'],
+                     avgPrice=p.get('avg_price'), currentValue=p.get('current_value'))
+            chain[p['asset']] = p
+        return (chain, True, 'complete')
+    except Exception as e:
+        return ({}, False, str(e))
 REFUTED_QUIET_SECS = 3600
 
 def refutation_is_new(lane, reason, now, path=None):

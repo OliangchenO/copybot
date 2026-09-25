@@ -84,16 +84,6 @@ pub struct Matchup {
     hist: Mutex<Option<(Instant, std::sync::Arc<History>)>>,
 }
 const HISTORY_FOR: Duration = Duration::from_secs(600);
-async fn get_json(
-    http: &reqwest::Client,
-    url: &str,
-) -> Result<serde_json::Value, String> {
-    let r = http.get(url).send().await.map_err(|e| format!("{e}"))?;
-    if !r.status().is_success() {
-        return Err(format!("HTTP {}", r.status()));
-    }
-    r.json().await.map_err(|e| format!("decode: {e}"))
-}
 fn f(v: &serde_json::Value, k: &str) -> f64 {
     v.get(k)
         .and_then(|x| x.as_f64())
@@ -106,28 +96,16 @@ fn s(v: &serde_json::Value, k: &str) -> String {
 async fn all_trades(
     http: &reqwest::Client,
     w: &str,
-    pages: usize,
+    _pages: usize,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let mut out = Vec::new();
-    for p in 0..pages {
-        let url = format!("{DATA_API}/trades?user={w}&limit=500&offset={}", p * 500);
-        let mut got = get_json(http, &url).await;
-        if got.is_err() {
-            got = get_json(http, &url).await;
-        }
-        match got {
-            Ok(serde_json::Value::Array(a)) => {
-                let n = a.len();
-                out.extend(a);
-                if n < 500 {
-                    break;
-                }
-            }
-            Err(e) if p == 0 => return Err(format!("trades page 0 for {w}: {e}")),
-            _ => break,
-        }
-    }
-    Ok(out)
+    let rows = crate::data_api_v2::fetch_all(http, DATA_API, "/v2/trades", &[("user", w)]).await?;
+    rows.into_iter().map(|mut row| {
+        let token = row["token_id"].as_str().or_else(|| row["asset_id"].as_str())
+            .ok_or("v2 trade token missing")?.to_owned();
+        row.as_object_mut().ok_or("v2 trade is not an object")?
+            .insert("asset".into(), serde_json::Value::String(token));
+        Ok(row)
+    }).collect()
 }
 impl Matchup {
     pub fn new() -> Self {
@@ -168,27 +146,16 @@ impl Matchup {
         him: &str,
         lane_epoch: Option<i64>,
     ) -> serde_json::Value {
-        let our_pos = get_json(
-                http,
-                &format!("{DATA_API}/positions?user={us}&sizeThreshold=0.01&limit=500"),
-            )
-            .await;
-        let his_pos = get_json(
-                http,
-                &format!("{DATA_API}/positions?user={him}&sizeThreshold=0.01&limit=500"),
-            )
-            .await;
-        let (our_pos, his_pos) = match (our_pos, his_pos) {
-            (Ok(a), Ok(b)) => (a, b),
-            (a, b) => {
-                return serde_json::json!(
-                    { "error" : format!("data-api: {:?} {:?}", a.err(), b.err()) }
-                );
-            }
-        };
-        let empty = vec![];
-        let ours: &Vec<_> = our_pos.as_array().unwrap_or(&empty);
-        let his: &Vec<_> = his_pos.as_array().unwrap_or(&empty);
+        let (our_pos, his_pos) = tokio::join!(
+            crate::positions::fetch(http, DATA_API, us, "0.01", "", crate::ledger::now_secs()),
+            crate::positions::fetch(http, DATA_API, him, "0.01", "", crate::ledger::now_secs()),
+        );
+        if !our_pos.may_act_destructively() || !his_pos.may_act_destructively() {
+            return serde_json::json!({"error": format!("data-api: {} / {}",
+                our_pos.completeness.reason(), his_pos.completeness.reason())});
+        }
+        let ours = &our_pos.rows;
+        let his = &his_pos.rows;
         if let Some((at, h)) = self.hist.lock().unwrap().as_ref() {
             if at.elapsed() < HISTORY_FOR {
                 return self.assemble(ours, his, h.clone());

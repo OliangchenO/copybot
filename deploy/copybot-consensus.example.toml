@@ -1,0 +1,71 @@
+# Separate dry-run configuration for the three-wallet consensus observer.
+# Replace YOUR_* values with your own read-only wallet/feed settings before use.
+# This file never authorizes real orders; consensus V1 rejects bot.mode = "live".
+[bot]
+mode = "dry"
+clob_host = "https://clob.polymarket.com"
+funder = "YOUR_SIMULATION_WALLET_ADDRESS"
+signature_type = 2
+events_path = "data/consensus-bot-events.jsonl"
+control_path = "run/consensus-operator.json"
+ledger_path = "data/consensus-ledger.jsonl"
+signal_guard_path = "data/consensus-signal-guard.jsonl"
+recovery_path = "run/consensus-watcher-recovery.jsonl"
+recycle_secs = 0
+
+[[feed]]
+name = "primary"
+url_env = "POLYGON_WSS"
+sockets = 1
+
+[[lane]]
+name = "ohio_consensus"
+wallet = "0x0c7c5204404e9d5402d258fedac59c7212bae4cb"
+enabled = true
+# Required by the existing lane contract; the consensus observer uses its own
+# $5/$10 targets and does not route this lane through direct-copy decisions.
+leader_max_order_usd = 100.0
+leader_peak_exposure_usd = 1000.0
+
+[lane.sizing]
+mode = "pct"
+pct = 0.005
+compound = false
+max_effective_pct = 0.05
+min_copy_usd = 0.5
+min_order_usd = 1.0
+min_fill_floor = true
+
+[lane.budget]
+bankroll_usd = 500.0
+min_buy_price = 0.20
+max_buy_price = 0.70
+
+[lane.execution]
+mode = "taker"
+buy_slippage_c = 0.15
+sell_slippage_c = 1.0
+sell_floor_frac = 0.0
+sell_all_frac = 0.0
+copy_makers = false
+copy_maker_sells = false
+
+[consensus]
+enabled = true
+primary_lane = "ohio_consensus"
+confirm_wallet = "0xdf7930e89a2c47560165331863c31deca0733dcd"
+veto_wallet = "0x3c58ef422754ff22c7e806336feba0064d8b776b"
+symbols = ["BTC", "ETH"]
+interval_minutes = 5
+min_purity = 0.60
+min_primary_directional_usd = 10.0
+min_buy_price = 0.20
+max_buy_price = 0.70
+two_wallet_target_usd = 5.0
+three_wallet_target_usd = 10.0
+confirm_window_seconds = 20
+min_remaining_seconds = 60
+max_state_age_seconds = 10
+events_path = "data/consensus-observer.jsonl"
+# Optional: provide POLYGON_CONSENSUS_RPC in the environment.
+rpc_env = "POLYGON_CONSENSUS_RPC"

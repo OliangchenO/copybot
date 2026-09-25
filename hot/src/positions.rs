@@ -80,17 +80,27 @@ impl Positions {
         self.rows.is_empty()
     }
 }
-pub fn page_url(
-    base: &str,
-    user: &str,
-    size_threshold: &str,
-    offset: usize,
-    extra: &str,
-) -> String {
-    format!(
-        "{base}/positions?user={user}&sizeThreshold={size_threshold}\
-             &limit={PAGE}&offset={offset}{extra}"
-    )
+/// Keep the legacy field names used by the existing exit and dashboard paths.
+/// A missing token or balance makes the entire snapshot unusable.
+pub fn v2_position(row: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut value = row.clone();
+    let object = value.as_object_mut().ok_or("position is not an object")?;
+    let aliases = [
+        ("asset", "token_id"), ("size", "current_size"),
+        ("conditionId", "condition_id"), ("avgPrice", "avg_price"),
+        ("curPrice", "current_price"), ("currentValue", "current_value"),
+        ("cashPnl", "total_pnl"), ("negativeRisk", "negative_risk"),
+    ];
+    for (old, new) in aliases {
+        if let Some(v) = object.get(new).cloned() {
+            object.insert(old.into(), v);
+        }
+    }
+    if object.get("asset").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).is_none()
+        || crate::data_api_v2::number_micros(&value["size"]).is_none() {
+        return Err("v2 position has no valid token or size".into());
+    }
+    Ok(value)
 }
 pub fn judge(
     page_lens: &[usize],
@@ -180,11 +190,13 @@ mod tests {
         assert_eq!(m.len(), 2, "a row with no asset is skipped, not fatal");
     }
     #[test]
-    fn page_url_advances_the_offset_and_keeps_extras() {
-        let u = page_url("https://x", "0xabc", "0.0001", 1000, "&redeemable=true");
-        assert!(u.contains("offset=1000"));
-        assert!(u.contains("limit=500"));
-        assert!(u.contains("redeemable=true"));
+    fn v2_position_preserves_legacy_consumers_and_rejects_missing_balance() {
+        let p = v2_position(&serde_json::json!({"token_id":"123","current_size":"1.25",
+            "condition_id":"0xabc","avg_price":0.4,"current_price":0.5})).unwrap();
+        assert_eq!(p["asset"], "123");
+        assert_eq!(p["size"], "1.25");
+        assert_eq!(p["curPrice"], 0.5);
+        assert!(v2_position(&serde_json::json!({"token_id":"123"})).is_err());
     }
 }
 pub async fn fetch(
@@ -195,39 +207,15 @@ pub async fn fetch(
     extra: &str,
     now: i64,
 ) -> Positions {
-    let mut rows = Vec::new();
-    let mut lens = Vec::new();
-    let mut failed = None;
-    for page in 0..MAX_PAGES {
-        let url = page_url(base, user, size_threshold, page * PAGE, extra);
-        let got = match http.get(&url).send().await {
-            Ok(r) if r.status().is_success() => {
-                r.json::<Vec<serde_json::Value>>()
-                    .await
-                    .map_err(|e| format!("decode: {e}"))
-            }
-            Ok(r) => Err(format!("http {}", r.status().as_u16())),
-            Err(e) => Err(format!("transport: {e}")),
-        };
-        match got {
-            Ok(batch) => {
-                let n = batch.len();
-                rows.extend(batch);
-                lens.push(n);
-                if n < PAGE {
-                    break;
-                }
-            }
-            Err(why) => {
-                failed = Some((page, why));
-                break;
-            }
-        }
-    }
-    let completeness = judge(&lens, failed, MAX_PAGES);
-    Positions {
-        rows,
-        completeness,
-        as_of: now,
+    let status = if extra.contains("redeemable=true") { "REDEEMABLE" } else { "OPEN" };
+    let archived = if extra.contains("includeArchived=true") { "true" } else { "false" };
+    let params = [("user", user), ("status", status),
+        ("filter_type", "TOKENS"), ("filter_amount", size_threshold),
+        ("include_archived", archived)];
+    match crate::data_api_v2::fetch_all(http, base, "/v2/positions", &params).await
+        .and_then(|raw| raw.iter().map(v2_position).collect::<Result<Vec<_>, _>>()) {
+        Ok(rows) => Positions { rows, completeness: Completeness::Complete, as_of: now },
+        Err(why) => Positions { rows: vec![],
+            completeness: Completeness::Failed { after_pages: 0, why }, as_of: now },
     }
 }

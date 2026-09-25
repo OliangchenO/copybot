@@ -326,7 +326,7 @@ fn legacy_full_release_correction_still_books_once_after_restart() {
 async fn http_smoke_empty_portfolio_closes_but_http_failure_does_not() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for (status, body, expected) in [
-        ("200 OK", "[]", true),
+        ("200 OK", r#"{"data":[],"pagination":{"next_cursor":null,"has_more":false}}"#, true),
         ("503 Service Unavailable", "[]", false),
         ("200 OK", "{}", false),
     ] {
@@ -342,7 +342,7 @@ async fn http_smoke_empty_portfolio_closes_but_http_failure_does_not() {
                     assert!(n > 0); request.extend_from_slice(&chunk[..n]);
                 }
                 let request = String::from_utf8(request).unwrap();
-                assert!(request.starts_with("GET /positions?user=synthetic-wallet&sizeThreshold=0&limit=500&offset=0&includeArchived=true "));
+                assert!(request.starts_with("GET /v2/positions?limit=500&user=synthetic-wallet&status=OPEN&filter_type=TOKENS&filter_amount=0&include_archived=true "));
                 let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 socket.write_all(response.as_bytes()).await.unwrap();
             }).await.unwrap();
