@@ -25,11 +25,17 @@ struct Entry {
     #[serde(default)]
     his_filled: f64,
     #[serde(default)]
+    his_usd: f64,
+    #[serde(default)]
     our_copied: f64,
+    #[serde(default)]
+    dry_covered_usd: f64,
     #[serde(default)]
     our_released: f64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     token: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    event: String,
 }
 #[derive(Debug, Clone)]
 struct Order {
@@ -37,7 +43,9 @@ struct Order {
     condition: [u8; 32],
     lane: String,
     his_filled: f64,
+    his_usd: f64,
     our_copied: f64,
+    dry_covered_usd: f64,
     our_released: f64,
     token: String,
 }
@@ -46,9 +54,16 @@ pub struct Progress {
     pub his_filled: f64,
     pub our_copied: f64,
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MarketProgress {
+    pub shares: Progress,
+    pub leader_usd: f64,
+    pub dry_covered_usd: f64,
+}
 struct State {
     orders: HashMap<[u8; 32], Order>,
     markets: HashMap<(String, [u8; 32]), (i64, [u8; 32], String)>,
+    seen: HashMap<String, i64>,
     file: File,
 }
 pub struct SignalGuard {
@@ -93,6 +108,18 @@ fn write_compacted(path: &Path, entries: &[Entry]) -> Result<(), String> {
 fn expire(state: &mut State, now: i64) {
     state.orders.retain(|_, o| now.saturating_sub(o.t) < ORDER_TTL_SECS);
     state.markets.retain(|_, (t, _, _)| now.saturating_sub(*t) < MARKET_TTL_SECS);
+    state.seen.retain(|_, t| now.saturating_sub(*t) < MARKET_TTL_SECS);
+}
+fn market_progress(state: &State, condition: &[u8; 32], lane: &str, token: &str) -> MarketProgress {
+    state.orders.values()
+        .filter(|o| o.condition == *condition && o.lane == lane && o.token == token)
+        .fold(MarketProgress::default(), |mut p, o| {
+            p.shares.his_filled += o.his_filled;
+            p.shares.our_copied += (o.our_copied - o.our_released).max(0.0);
+            p.leader_usd += o.his_usd;
+            p.dry_covered_usd += o.dry_covered_usd;
+            p
+        })
 }
 fn market_gate(
     state: &State,
@@ -101,6 +128,7 @@ fn market_gate(
     lane: &str,
     token: &str,
     now: i64,
+    allow_both_sides: bool,
 ) -> Result<(), Refusal> {
     for key in [(String::new(), *condition), (lane.to_string(), *condition)] {
         if let Some((t, owner, owner_token)) = state.markets.get(&key) {
@@ -108,6 +136,9 @@ fn market_gate(
                 continue;
             }
             if !owner_token.is_empty() && owner_token == token {
+                continue;
+            }
+            if allow_both_sides && !key.0.is_empty() && key.0 == lane {
                 continue;
             }
             return Err(Refusal::MarketCooldown {
@@ -143,6 +174,7 @@ impl SignalGuard {
         }
         let mut orders: HashMap<[u8; 32], Order> = HashMap::new();
         let mut markets: HashMap<(String, [u8; 32]), (i64, [u8; 32], String)> = HashMap::new();
+        let mut seen = HashMap::new();
         let mut compacted = Vec::new();
         let mut saw_any = path.exists();
         let mut wal_rows = 0usize;
@@ -216,7 +248,9 @@ impl SignalGuard {
                             condition,
                             lane: entry.lane.clone(),
                             his_filled: 0.0,
+                            his_usd: 0.0,
                             our_copied: 0.0,
+                            dry_covered_usd: 0.0,
                             our_released: 0.0,
                             token: entry.token.clone(),
                         });
@@ -225,7 +259,9 @@ impl SignalGuard {
                     }
                     slot.t = slot.t.max(entry.t);
                     slot.his_filled = slot.his_filled.max(entry.his_filled);
+                    slot.his_usd = slot.his_usd.max(entry.his_usd);
                     slot.our_copied = slot.our_copied.max(entry.our_copied);
+                    slot.dry_covered_usd = slot.dry_covered_usd.max(entry.dry_covered_usd);
                     slot.our_released = slot.our_released.max(entry.our_released);
                     if !entry.lane.is_empty() {
                         slot.lane = entry.lane.clone();
@@ -240,6 +276,9 @@ impl SignalGuard {
                                 }
                             })
                             .or_insert((entry.t, salt, tok));
+                    }
+                    if !entry.event.is_empty() {
+                        seen.insert(entry.event.clone(), entry.t);
                     }
                     if is_wal {
                         wal_rows += 1;
@@ -268,7 +307,7 @@ impl SignalGuard {
         Ok((
             Self {
                 path,
-                inner: Mutex::new(State { orders, markets, file }),
+                inner: Mutex::new(State { orders, markets, seen, file }),
             },
             wal_rows,
         ))
@@ -304,7 +343,9 @@ impl SignalGuard {
                 condition: *condition,
                 lane: lane.to_string(),
                 his_filled: 0.0,
+                his_usd: 0.0,
                 our_copied: 0.0,
+                dry_covered_usd: 0.0,
                 our_released: 0.0,
                 token: String::new(),
             });
@@ -315,6 +356,74 @@ impl SignalGuard {
             our_copied: (slot.our_copied - slot.our_released).max(0.0),
         })
     }
+    pub fn observe_market(
+        &self,
+        salt: &[u8; 32],
+        condition: &[u8; 32],
+        lane: &str,
+        token: &str,
+        event: &str,
+        fill_size: f64,
+        price: f64,
+        his_order_size: f64,
+        now: i64,
+    ) -> Result<MarketProgress, Refusal> {
+        if salt.iter().all(|&b| b == 0) || condition.iter().all(|&b| b == 0)
+            || lane.is_empty() || token.is_empty() || event.is_empty()
+            || !fill_size.is_finite() || fill_size <= 0.0
+            || !price.is_finite() || price <= 0.0 || price >= 1.0
+        {
+            return Err(Refusal::InvalidIdentity);
+        }
+        let mut state = self.inner.lock()
+            .map_err(|_| Refusal::Persistence("signal-guard mutex poisoned".into()))?;
+        expire(&mut state, now);
+        if state.seen.contains_key(event) {
+            return Err(Refusal::DuplicateOrder);
+        }
+        let old = state.orders.get(salt);
+        if old.is_some_and(|o| o.condition != *condition || o.lane != lane
+            || (!o.token.is_empty() && o.token != token)) {
+            return Err(Refusal::InvalidIdentity);
+        }
+        let ceiling = if his_order_size > 0.0 { his_order_size } else { f64::INFINITY };
+        let old_shares = old.map_or(0.0, |o| o.his_filled);
+        let his_filled = (old_shares + fill_size).min(ceiling);
+        let his_usd = old.map_or(0.0, |o| o.his_usd) + (his_filled - old_shares) * price;
+        let entry = Entry {
+            t: now,
+            salt: hex::encode(salt),
+            condition: hex::encode(condition),
+            lane: lane.to_string(),
+            his_filled,
+            his_usd,
+            our_copied: old.map_or(0.0, |o| o.our_copied),
+            dry_covered_usd: old.map_or(0.0, |o| o.dry_covered_usd),
+            our_released: old.map_or(0.0, |o| o.our_released),
+            token: token.to_string(),
+            event: event.to_string(),
+        };
+        let line = serde_json::to_vec(&entry)
+            .map_err(|e| Refusal::Persistence(format!("serialize signal guard: {e}")))?;
+        state.file.write_all(&line)
+            .and_then(|_| state.file.write_all(b"\n"))
+            .and_then(|_| state.file.flush())
+            .and_then(|_| state.file.sync_data())
+            .map_err(|e| Refusal::Persistence(format!("write {}: {e}", self.path.display())))?;
+        state.orders.insert(*salt, Order {
+            t: now,
+            condition: *condition,
+            lane: lane.to_string(),
+            his_filled,
+            his_usd,
+            our_copied: entry.our_copied,
+            dry_covered_usd: entry.dry_covered_usd,
+            our_released: entry.our_released,
+            token: token.to_string(),
+        });
+        state.seen.insert(event.to_string(), now);
+        Ok(market_progress(&state, condition, lane, token))
+    }
     pub fn check(
         &self,
         salt: &[u8; 32],
@@ -322,6 +431,18 @@ impl SignalGuard {
         lane: &str,
         token: &str,
         now: i64,
+    ) -> Result<(), Refusal> {
+        self.check_inner(salt, condition, lane, token, now, false)
+    }
+    pub fn check_aggregate(
+        &self, salt: &[u8; 32], condition: &[u8; 32], lane: &str,
+        token: &str, now: i64,
+    ) -> Result<(), Refusal> {
+        self.check_inner(salt, condition, lane, token, now, true)
+    }
+    fn check_inner(
+        &self, salt: &[u8; 32], condition: &[u8; 32], lane: &str,
+        token: &str, now: i64, allow_both_sides: bool,
     ) -> Result<(), Refusal> {
         if salt.iter().all(|&b| b == 0) || condition.iter().all(|&b| b == 0) {
             return Err(Refusal::InvalidIdentity);
@@ -331,7 +452,7 @@ impl SignalGuard {
             .lock()
             .map_err(|_| Refusal::Persistence("signal-guard mutex poisoned".into()))?;
         expire(&mut state, now);
-        market_gate(&state, salt, condition, lane, token, now)
+        market_gate(&state, salt, condition, lane, token, now, allow_both_sides)
     }
     pub fn commit(
         &self,
@@ -342,7 +463,13 @@ impl SignalGuard {
         shares: f64,
         now: i64,
     ) -> Result<(), Refusal> {
-        self.commit_inner(salt, condition, lane, token, shares, now, None, None)
+        self.commit_inner(salt, condition, lane, token, shares, 0.0, now, None, None, false)
+    }
+    pub fn commit_dry_aggregate(
+        &self, salt: &[u8; 32], condition: &[u8; 32], lane: &str,
+        token: &str, shares: f64, usd: f64, now: i64,
+    ) -> Result<(), Refusal> {
+        self.commit_inner(salt, condition, lane, token, shares, usd, now, None, None, true)
     }
     pub fn commit_with(
         &self,
@@ -355,7 +482,14 @@ impl SignalGuard {
         wal: &crate::wal::Wal,
         extra: Option<&[u8]>,
     ) -> Result<(), Refusal> {
-        self.commit_inner(salt, condition, lane, token, shares, now, Some(wal), extra)
+        self.commit_inner(salt, condition, lane, token, shares, 0.0, now, Some(wal), extra, false)
+    }
+    pub fn commit_with_aggregate(
+        &self, salt: &[u8; 32], condition: &[u8; 32], lane: &str,
+        token: &str, shares: f64, now: i64, wal: &crate::wal::Wal,
+        extra: Option<&[u8]>,
+    ) -> Result<(), Refusal> {
+        self.commit_inner(salt, condition, lane, token, shares, 0.0, now, Some(wal), extra, true)
     }
     fn commit_inner(
         &self,
@@ -364,9 +498,11 @@ impl SignalGuard {
         lane: &str,
         token: &str,
         shares: f64,
+        dry_usd: f64,
         now: i64,
         wal: Option<&crate::wal::Wal>,
         extra: Option<&[u8]>,
+        allow_both_sides: bool,
     ) -> Result<(), Refusal> {
         if salt.iter().all(|&b| b == 0) || condition.iter().all(|&b| b == 0) {
             return Err(Refusal::InvalidIdentity);
@@ -379,11 +515,11 @@ impl SignalGuard {
             .lock()
             .map_err(|_| Refusal::Persistence("signal-guard mutex poisoned".into()))?;
         expire(&mut state, now);
-        market_gate(&state, salt, condition, lane, token, now)?;
-        let (his_filled, already, released) = match state.orders.get(salt) {
+        market_gate(&state, salt, condition, lane, token, now, allow_both_sides)?;
+        let (his_filled, his_usd, already, released, dry_covered) = match state.orders.get(salt) {
             Some(o) if o.condition != *condition => return Err(Refusal::InvalidIdentity),
-            Some(o) => (o.his_filled, o.our_copied, o.our_released),
-            None => (0.0, 0.0, 0.0),
+            Some(o) => (o.his_filled, o.his_usd, o.our_copied, o.our_released, o.dry_covered_usd),
+            None => (0.0, 0.0, 0.0, 0.0, 0.0),
         };
         let entry = Entry {
             t: now,
@@ -391,9 +527,12 @@ impl SignalGuard {
             condition: hex::encode(condition),
             lane: lane.to_string(),
             his_filled,
+            his_usd,
             our_copied: already + shares,
+            dry_covered_usd: dry_covered + dry_usd,
             our_released: released,
             token: token.to_string(),
+            event: String::new(),
         };
         let line = serde_json::to_vec(&entry)
             .map_err(|e| Refusal::Persistence(format!("serialize signal guard: {e}")))?;
@@ -426,7 +565,9 @@ impl SignalGuard {
                 condition: *condition,
                 lane: lane.to_string(),
                 his_filled,
+                his_usd,
                 our_copied: 0.0,
+                dry_covered_usd: 0.0,
                 our_released: 0.0,
                 token: token.to_string(),
             });
@@ -435,6 +576,7 @@ impl SignalGuard {
         }
         slot.t = now;
         slot.our_copied += shares;
+        slot.dry_covered_usd += dry_usd;
         slot.lane = lane.to_string();
         state
             .markets
@@ -474,9 +616,12 @@ impl SignalGuard {
             condition: hex::encode(condition),
             lane: lane.to_string(),
             his_filled: o.his_filled,
+            his_usd: o.his_usd,
             our_copied: o.our_copied,
+            dry_covered_usd: o.dry_covered_usd,
             our_released: o.our_released + give_back,
             token: o.token.clone(),
+            event: String::new(),
         };
         let line = serde_json::to_vec(&entry)
             .map_err(|e| Refusal::Persistence(format!("serialize signal guard: {e}")))?;
@@ -860,6 +1005,49 @@ mod tests {
             Err(Refusal::InvalidIdentity)
         );
         drop(guard);
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn market_observations_aggregate_across_orders_and_survive_restart() {
+        let path = temp("market-aggregate");
+        let g = SignalGuard::open(&path, 1_000).unwrap();
+        let p = g.observe_market(&key(1), &key(9), L, TOK, "tx1:1", 5.0, 0.5, 5.0, 1_000).unwrap();
+        assert_eq!(p.leader_usd, 2.5);
+        let p = g.observe_market(&key(2), &key(9), L, TOK, "tx2:2", 7.0, 0.5, 7.0, 1_001).unwrap();
+        assert_eq!(p.shares.his_filled, 12.0);
+        g.commit(&key(2), &key(9), L, TOK, 2.0, 1_001).unwrap();
+        let p = g.observe_market(&key(3), &key(9), L, TOK, "tx3:3", 8.0, 0.5, 8.0, 1_002).unwrap();
+        assert_eq!(p.shares, Progress { his_filled: 20.0, our_copied: 2.0 });
+        assert_eq!(p.leader_usd, 10.0);
+        drop(g);
+        let g = SignalGuard::open(&path, 1_003).unwrap();
+        assert_eq!(g.observe_market(&key(2), &key(9), L, TOK, "tx2:2", 7.0, 0.5, 7.0, 1_003), Err(Refusal::DuplicateOrder));
+        let p = g.observe_market(&key(4), &key(9), L, TOK, "tx4:4", 5.0, 0.5, 5.0, 1_004).unwrap();
+        assert_eq!(p.shares, Progress { his_filled: 25.0, our_copied: 2.0 });
+        g.release(&key(2), &key(9), L, 2.0, 1_004).unwrap();
+        let p = g.observe_market(&key(5), &key(9), L, TOK, "tx5:5", 5.0, 0.5, 5.0, 1_005).unwrap();
+        assert_eq!(p.shares, Progress { his_filled: 30.0, our_copied: 0.0 });
+        assert_eq!(p.leader_usd, 15.0);
+        drop(g);
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn aggregate_mode_keeps_yes_and_no_dollar_totals_separate() {
+        let path = temp("both-outcomes");
+        let g = SignalGuard::open(&path, 1_000).unwrap();
+        let yes = g.observe_market(&key(1), &key(9), L, TOK, "yes", 6.0, 0.5, 6.0, 1_000).unwrap();
+        assert_eq!(yes.leader_usd, 3.0);
+        g.commit_dry_aggregate(&key(1), &key(9), L, TOK, 2.0, 1.2, 1_000).unwrap();
+        let no = g.observe_market(&key(2), &key(9), L, TOK_OTHER, "no", 10.0, 0.4, 10.0, 1_001).unwrap();
+        assert_eq!(no.leader_usd, 4.0);
+        assert_eq!(no.dry_covered_usd, 0.0);
+        assert!(matches!(g.check(&key(2), &key(9), L, TOK_OTHER, 1_001), Err(Refusal::MarketCooldown { .. })));
+        g.check_aggregate(&key(2), &key(9), L, TOK_OTHER, 1_001).unwrap();
+        g.commit_dry_aggregate(&key(2), &key(9), L, TOK_OTHER, 2.0, 1.1, 1_001).unwrap();
+        let yes = g.observe_market(&key(3), &key(9), L, TOK, "yes-more", 2.0, 0.5, 2.0, 1_002).unwrap();
+        assert_eq!(yes.leader_usd, 4.0);
+        assert_eq!(yes.dry_covered_usd, 1.2);
+        drop(g);
         let _ = std::fs::remove_file(path);
     }
     #[test]

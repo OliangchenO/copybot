@@ -1,61 +1,103 @@
-# Copy to deploy/copybot2.toml (ignored by Git). These are illustrative values,
-# not a copy of an operator's strategy. Replace every YOUR_* field before use.
+# 复制为 deploy/copybot2.toml 后按自己的账户和策略填写；本文件仅是示例。
+# 实际配置中的地址、订阅地址和签名密钥不要提交到 Git。
 [bot]
+# 自动清理领头仓位归零/本方超额仓位；设为 false 只关闭自动扫尾，不影响镜像领头 SELL。
+position_sweep_enabled = false
+# 运行模式：dry 只模拟；live 会提交真实订单。仍需在操作状态中 arm 才允许买入。
 mode = "dry"
+# Polymarket CLOB API 地址。
 clob_host = "https://clob.polymarket.com"
+# 持有资金的地址；可能与签名地址不同。
 funder = "YOUR_FUNDER_ADDRESS"
+# 签名私钥对应的地址；私钥只放在本机环境文件，不写进 TOML。
 signer = "YOUR_SIGNER_ADDRESS"
+# 账户的签名类型，必须与实际钱包类型一致。
 signature_type = 2
+# 事件日志的持久化路径。
 events_path = "data/events.jsonl"
+# 运行控制状态的基础路径。
 control_path = "run/operator.json"
+# 实际成交和持仓账本路径。
 ledger_path = "data/ledger.jsonl"
+# 目标信号去重与聚合金额的持久化路径。
 signal_guard_path = "data/signal-guard.jsonl"
+# WebSocket 源的定期评分/轮换间隔，单位秒；0 表示关闭。
 recycle_secs = 0
+# 是否同时尝试 HTTP/1 和 HTTP/2 下单通道。
 race_h2 = true
-# Set only when the watcher should recover fresh leader fills from chain calldata.
+# 恢复漏掉的目标钱包成交时，读取链上 RPC 的环境变量名。
 recovery_rpc_env = "POLYGON_RECOVERY_RPC"
+# 漏单恢复记录路径。
 recovery_path = "run/watcher_recovery.jsonl"
 
 [[feed]]
+# 第一条 Polygon 待处理交易订阅源的名称。
 name = "primary"
+# 第一条订阅源的 WebSocket 地址。
 url = "wss://YOUR_FEED_HOST/YOUR_FEED_PATH"
+# 向第一条订阅源建立的连接数。
 sockets = 1
 
 [[feed]]
+# 备用订阅源名称。
 name = "backup"
+# 存放备用 wss:// 地址的环境变量名，不是地址本身。
 url_env = "POLYGON_BACKUP_WSS"
+# 向备用订阅源建立的连接数。
 sockets = 1
 
 [[lane]]
+# 跟单通道的唯一名称。
 name = "leader_alpha"
+# 要跟随的目标钱包地址。
 wallet = "YOUR_LEADER_ADDRESS"
+# 是否加载此通道；false 不会运行此通道。
 enabled = false
-# Supply your leader's measured values; do not reuse someone else's statistics.
+# 目标钱包实测的最大单笔金额，用于校验预算；不要借用其他钱包的数据。
 leader_max_order_usd = 0.0
+# 目标钱包实测的历史峰值敞口，用于校验预算。
 leader_peak_exposure_usd = 0.0
 
 [lane.sizing]
+# pct 按目标成交金额的比例计算计划跟单金额。
 mode = "pct"
+# 原始跟单比例；0.005 表示 0.5%。
 pct = 0.005
+# 是否根据已实现收益动态调整跟单比例。
 compound = false
+# 动态比例允许达到的上限。
 max_effective_pct = 0.05
-# Skip a planned proportional buy below this amount; it is never rounded up.
+# 计划买入金额低于此值就跳过，不会为了过门槛而抬高订单。
 min_copy_usd = 0.5
-# Orders that pass min_copy_usd but are below this value may be lifted when
-# min_fill_floor is true. Keep this at the venue's $1 submission floor.
+# 是否按同一市场、同一 YES/NO 方向累计目标钱包的小额买入。
+aggregate_small_buys = false
+# 累计模式下，未覆盖的目标钱包金额必须大于此值才尝试买入，单位美元。
+aggregate_trigger_usd = 10.0
+# 提交买单的最低美元金额；Taker 通常至少需要 $1。
 min_order_usd = 1.0
+# 普通模式是否把低于 min_order_usd 的计划订单抬至最低金额；累计模式不会抬高。
 min_fill_floor = true
 
 [lane.budget]
+# 预算基数；下列比例由它推导敞口、单市场、单笔和每日上限。
 bankroll_usd = 100.0
+# 允许买入的目标成交价格最高值（0 到 1）。
 max_buy_price = 0.95
+# 允许买入的目标成交价格最低值（0 到 1）。
 min_buy_price = 0.02
 
 [lane.execution]
+# taker 立即吃单；其他执行模式由程序的执行策略决定。
 mode = "taker"
+# 买入最高限价 = 目标价 + 此增量；0.15 表示 15 美分，而非 0.15 美分。
 buy_slippage_c = 0.15
+# 卖出最低限价 = 目标价 - 此增量，同时受下方 sell_floor_frac 约束。
 sell_slippage_c = 1.0
+# 卖出限价相对于目标成交价的最低比例；0 表示不施加这一比例下限。
 sell_floor_frac = 0.0
+# 目标钱包卖出比例达到此值时卖光我方持仓；0 表示任何卖出都触发全卖。
 sell_all_frac = 0.0
+# 是否跟随目标钱包的 Maker 买单。
 copy_makers = false
+# 是否跟随目标钱包的 Maker 卖单。
 copy_maker_sells = false

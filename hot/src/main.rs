@@ -1880,7 +1880,8 @@ actually reach the venue and are refused. This key controls no funds."
     emitter
         .emit(
             serde_json::json!(
-                { "t" : now_ms(), "ev" : "boot", "mode" : root.bot.mode, "lanes" : router
+                { "t" : now_ms(), "ev" : "boot", "mode" : root.bot.mode,
+                "position_sweep_enabled" : root.bot.position_sweep_enabled, "lanes" : router
                 .snapshot().iter().map(| l | serde_json::json!({ "name" : l.cfg.name,
                 "wallet" : format!("0x{}", hex::encode(l.cfg.wallet20)), "sizing" :
                 format!("{:?}", l.policy().sizing), "execution" : format!("{:?}", l.cfg
@@ -1954,6 +1955,7 @@ actually reach the venue and are refused. This key controls no funds."
         &wal_path,
         &["signal_guard", "pending"],
     );
+    let aggregate_dry = !live && root.lane.iter().any(|l| l.enabled && l.sizing.aggregate_small_buys);
     let signal_guard = if live && !shadow {
         match copybot_hot::signal_guard::SignalGuard::open_absorbing(
             &root.bot.signal_guard_path,
@@ -1966,6 +1968,16 @@ actually reach the venue and are refused. This key controls no funds."
             }
             Err(e) => {
                 eprintln!("REFUSING TO START: signal guard unavailable: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else if aggregate_dry {
+        wal_recovery.absorbed("signal_guard", 0);
+        let path = format!("{}.aggregate-dry", root.bot.signal_guard_path);
+        match copybot_hot::signal_guard::SignalGuard::open(&path, copybot_hot::ledger::now_secs()) {
+            Ok(guard) => Some(Arc::new(guard)),
+            Err(e) => {
+                eprintln!("REFUSING TO START: aggregate dry signal guard unavailable: {e}");
                 std::process::exit(2);
             }
         }
@@ -2363,12 +2375,10 @@ the rescue ladder. Attribute it, or flatten by hand, rather than leaving it."
         let fetch = |w: String| {
             let c = rec_http.clone();
             async move {
-                let snap = copybot_hot::positions::fetch(
+                let snap = copybot_hot::positions::fetch_v2_boot(
                         &c,
                         "https://data-api.polymarket.com",
                         &w,
-                        "0.01",
-                        "",
                         copybot_hot::ledger::now_secs(),
                     )
                     .await;
@@ -2942,11 +2952,14 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
             tokio::spawn(async move {
                 const PAGE: usize = 500;
                 const MAX_PAGES: usize = 20;
+                let mut backfill_complete = false;
                 let mut tick = tokio::time::interval(Duration::from_secs(300));
                 loop {
                     tick.tick().await;
                     let mut scanned = 0usize;
-                    for page in 0..MAX_PAGES {
+                    let page_limit = if backfill_complete { 1 } else { MAX_PAGES };
+                    let mut sweep_complete = true;
+                    for page in 0..page_limit {
                         let url = format!(
                             "https://data-api.polymarket.com/trades?user={funder_t}\
                              &limit={PAGE}&offset={}",
@@ -2960,7 +2973,10 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                             Ok(r) if r.status().is_success() => {
                                 r.json().await.unwrap_or_default()
                             }
-                            _ => break,
+                            _ => {
+                                sweep_complete = false;
+                                break;
+                            }
                         };
                         let n = rows.len();
                         if n > 0 {
@@ -2979,6 +2995,9 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                         if n < PAGE {
                             break;
                         }
+                    }
+                    if !backfill_complete && sweep_complete {
+                        backfill_complete = true;
                     }
                     eprintln!(
                         "[titles] sweep: {scanned} trades scanned, {} known", cache_t
@@ -4500,6 +4519,7 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
     }
     let (sweep_tx, mut sweep_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let sweep_tx = std::sync::Arc::new(sweep_tx);
+    let position_sweep_enabled = root.bot.position_sweep_enabled;
     if live {
         let pend3 = pending_log.clone();
         let inc3 = incidents.clone();
@@ -4535,6 +4555,9 @@ derived but are NOT accepted; every order would be refused. Refusing to continue
                     tokio::time::sleep(Duration::from_secs(3)). await; match tok {
                     Some(t) => Some(t), None => continue } }
                 };
+                if !position_sweep_enabled {
+                    continue;
+                }
                 let Some(cr) = creds3.as_ref() else { continue };
                 let Some(key) = pk3.as_ref() else { continue };
                 let url = format!(
@@ -7790,20 +7813,36 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                     his_filled: d.fill_size,
                     our_copied: 0.0,
                 };
+                let mut aggregate_progress = None;
                 if d.side == 0 {
-                    if let Some(guard) = &signal_guard {
-                        match guard
-                            .observe(
-                                &d.salt,
-                                &d.condition_id,
-                                &lane.cfg.name,
-                                d.fill_size,
-                                d.order_size,
+                    if let Some(guard) = signal_guard.as_ref().filter(|_| live || lane.cfg.aggregate_small_buys) {
+                        let observed = if lane.cfg.aggregate_small_buys {
+                            let event = format!("{}:{}:{}", raw.hash, hex::encode(d.salt), d.occurrence);
+                            guard.observe_market(
+                                &d.salt, &d.condition_id, &lane.cfg.name, &d.token_id,
+                                &event, d.fill_size, d.price, d.order_size,
+                                copybot_hot::ledger::now_secs(),
+                            ).map(|p| {
+                                aggregate_progress = Some(p);
+                                p.shares
+                            })
+                        } else {
+                            guard.observe(
+                                &d.salt, &d.condition_id, &lane.cfg.name,
+                                d.fill_size, d.order_size,
                                 copybot_hot::ledger::now_secs(),
                             )
+                        };
+                        match observed
                         {
                             Ok(p) => progress = p,
                             Err(reason) => {
+                                if matches!(reason, copybot_hot::signal_guard::Refusal::Persistence(_)) {
+                                    latch_buys(
+                                        &lane, &incidents, "persistence",
+                                        "signal guard observation cannot persist",
+                                    );
+                                }
                                 emitter
                                     .emit(
                                         serde_json::json!(
@@ -7817,14 +7856,18 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                 continue;
                             }
                         }
-                        if let Err(reason) = guard
-                            .check(
-                                &d.salt,
-                                &d.condition_id,
-                                &lane.cfg.name,
-                                &d.token_id,
+                        let checked = if lane.cfg.aggregate_small_buys {
+                            guard.check_aggregate(
+                                &d.salt, &d.condition_id, &lane.cfg.name, &d.token_id,
                                 copybot_hot::ledger::now_secs(),
                             )
+                        } else {
+                            guard.check(
+                                &d.salt, &d.condition_id, &lane.cfg.name, &d.token_id,
+                                copybot_hot::ledger::now_secs(),
+                            )
+                        };
+                        if let Err(reason) = checked
                         {
                             emitter
                                 .emit(
@@ -7863,7 +7906,34 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                         fps.forget(&d.token_id);
                     }
                 }
-                let decided = router.decide(lane_ix, &d, progress);
+                let mut aggregate_amounts = None;
+                let decided = if lane.cfg.aggregate_small_buys && d.side == 0 {
+                    match aggregate_progress {
+                        Some(p) => {
+                            let covered_usd = if live {
+                                let booked = control.lock().unwrap().ledger.lanes
+                                    .get(&lane.cfg.name)
+                                    .and_then(|b| b.positions.get(&d.token_id))
+                                    .map(|pos| pos.cost.max(0.0))
+                                    .unwrap_or(0.0);
+                                let pending = pending_log.lock().unwrap().in_flight().by_token
+                                    .get(&(lane.cfg.name.clone(), d.token_id.clone()))
+                                    .copied().unwrap_or(0.0);
+                                booked + pending
+                            } else {
+                                p.dry_covered_usd
+                            };
+                            let amounts = copybot_hot::lanes::AggregateAmounts {
+                                leader_usd: p.leader_usd, covered_usd,
+                            };
+                            aggregate_amounts = Some(amounts);
+                            router.decide_with_amounts(lane_ix, &d, progress, Some(amounts))
+                        }
+                        None => Err(copybot_hot::lanes::Skip::NotReady),
+                    }
+                } else {
+                    router.decide(lane_ix, &d, progress)
+                };
                 let lane_name = lane.cfg.name.clone();
                 if d.side == 1 {
                     let his_now = control
@@ -7889,7 +7959,9 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                     "side" : if d.side ==
                                     0 { "BUY" } else { "SELL" }, "px" : d.price, "his_fill" : d
                                     .fill_size, "his_order" : d.order_size, "his_order_id" :
-                                    hex::encode(d.salt), "progress_committed" : d.side == 0, }
+                                    hex::encode(d.salt), "progress_committed" : d.side == 0,
+                                    "aggregate_leader_usd": aggregate_amounts.map(|a| a.leader_usd),
+                                    "aggregate_covered_usd": aggregate_amounts.map(|a| a.covered_usd), }
                                 ),
                             );
                     }
@@ -8070,9 +8142,26 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                             10000.0).round() / 100.0, "his_fill" : d.fill_size,
                             "his_order" : d.order_size, "his_remaining" : intent
                             .his_remaining, "exec" : format!("{:?}", intent.execution),
-                            "signal_to_ready_us" : elapsed_us, "queue_us" : queue_us, }
+                            "signal_to_ready_us" : elapsed_us, "queue_us" : queue_us,
+                            "aggregate_leader_usd": aggregate_amounts.map(|a| a.leader_usd),
+                            "aggregate_covered_usd": aggregate_amounts.map(|a| a.covered_usd), }
                         );
                         if !live {
+                            if lane.cfg.aggregate_small_buys && intent.side == 0 {
+                                if let Some(guard) = &signal_guard {
+                                    if let Err(reason) = guard.commit_dry_aggregate(
+                                        &d.salt, &d.condition_id, &lane_name, &intent.token_id,
+                                        intent.shares, intent.usd as f64 / MICRO,
+                                        copybot_hot::ledger::now_secs(),
+                                    ) {
+                                        emitter.emit(serde_json::json!({
+                                            "t": now_ms(), "ev": "signal_guard_skip", "lane": lane_name,
+                                            "tok": intent.token_id, "why": format!("{reason:?}"),
+                                        }));
+                                        continue;
+                                    }
+                                }
+                            }
                             emitter.emit(fire_ev.clone());
                         }
                         if live {
@@ -8192,8 +8281,14 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                     resting: order_type == "GTC",
                                 };
                                 let row = copybot_hot::pending::PendingLog::row_bytes(&p);
-                                if let Err(reason) = guard
-                                    .commit_with(
+                                let committed = if lane.cfg.aggregate_small_buys {
+                                    guard.commit_with_aggregate(
+                                        &d.salt, &d.condition_id, &lane_name, &intent.token_id,
+                                        intent.shares, copybot_hot::ledger::now_secs(),
+                                        &wal, Some(&row),
+                                    )
+                                } else {
+                                    guard.commit_with(
                                         &d.salt,
                                         &d.condition_id,
                                         &lane_name,
@@ -8203,7 +8298,8 @@ savings withdrawal — nothing was done automatically. Check the market by hand.
                                         &wal,
                                         Some(&row),
                                     )
-                                {
+                                };
+                                if let Err(reason) = committed {
                                     if matches!(
                                         reason, copybot_hot::signal_guard::Refusal::Persistence(_)
                                     ) {

@@ -65,6 +65,8 @@ pub struct LaneConfig {
     /// Ignore a proportional buy target below this amount; unlike `min_order_usd`,
     /// it never increases an order's size.
     pub min_copy_usd: f64,
+    pub aggregate_small_buys: bool,
+    pub aggregate_trigger_usd: f64,
     pub min_order_usd: f64,
     pub max_usd_per_fill: f64,
     pub daily_budget_usd: f64,
@@ -113,6 +115,11 @@ impl LaneConfig {
                 self.name, self.min_order_usd
             ));
         }
+        if self.aggregate_small_buys
+            && (!self.aggregate_trigger_usd.is_finite() || self.aggregate_trigger_usd <= 0.0)
+        {
+            return Err(format!("lane {}: aggregate_trigger_usd must be positive", self.name));
+        }
         if self.min_buy_price <= 0.0 || self.max_buy_price >= 1.0
             || self.min_buy_price >= self.max_buy_price
         {
@@ -121,6 +128,9 @@ impl LaneConfig {
             );
         }
         match self.sizing {
+            Sizing::Shares(_) | Sizing::Usd(_) if self.aggregate_small_buys => {
+                Err(format!("lane {}: aggregate_small_buys requires pct sizing", self.name))
+            }
             Sizing::Shares(n) if n <= 0.0 => {
                 Err(format!("lane {}: shares <= 0", self.name))
             }
@@ -349,6 +359,11 @@ pub struct Router {
     lanes: std::sync::RwLock<Vec<std::sync::Arc<Lane>>>,
     owner: Mutex<HashMap<String, (usize, i64)>>,
 }
+#[derive(Debug, Clone, Copy)]
+pub struct AggregateAmounts {
+    pub leader_usd: f64,
+    pub covered_usd: f64,
+}
 impl Router {
     pub fn new(lanes: Vec<Lane>) -> Self {
         let lanes = lanes.into_iter().map(std::sync::Arc::new).collect();
@@ -465,6 +480,15 @@ impl Router {
         d: &Decoded,
         progress: Progress,
     ) -> Result<Intent, Skip> {
+        self.decide_with_amounts(lane_ix, d, progress, None)
+    }
+    pub fn decide_with_amounts(
+        &self,
+        lane_ix: usize,
+        d: &Decoded,
+        progress: Progress,
+        aggregate: Option<AggregateAmounts>,
+    ) -> Result<Intent, Skip> {
         let lane = match self.lane(lane_ix) {
             Some(l) => l,
             None => return Err(Skip::Disarmed),
@@ -557,6 +581,24 @@ impl Router {
             Sizing::Shares(n) => (ceil_shares(n), progress.our_copied <= 0.0),
             Sizing::Usd(u) => (whole(u / limit), progress.our_copied <= 0.0),
             Sizing::Pct(p) => {
+                if c.aggregate_small_buys {
+                    let amounts = aggregate.ok_or(Skip::NotReady)?;
+                    let effective = crate::budget::effective_pct(
+                        p, scale, pol.max_effective_pct, pol.compound,
+                    );
+                    if !amounts.leader_usd.is_finite() || !amounts.covered_usd.is_finite()
+                        || effective <= 0.0
+                    {
+                        return Err(Skip::NotReady);
+                    }
+                    let gap = amounts.leader_usd - amounts.covered_usd / effective;
+                    if gap <= c.aggregate_trigger_usd + 1e-9 {
+                        return Err(Skip::BelowCopyMinimum);
+                    }
+                    let planned_usd = gap * effective;
+                    let shares = ((planned_usd / limit * 100.0) + 1e-9).floor() / 100.0;
+                    (shares, false)
+                } else {
                 let target = progress.his_filled.max(d.fill_size)
                     * crate::budget::effective_pct(
                         p,
@@ -566,10 +608,11 @@ impl Router {
                     ) * (d.price / limit);
                 let remaining = target - progress.our_copied;
                 (whole(remaining), remaining > 1e-9)
+                }
             }
         };
         if shares <= 0.0 {
-            if !c.min_fill_floor || !floor_eligible {
+            if c.aggregate_small_buys || !c.min_fill_floor || !floor_eligible {
                 return Err(Skip::DustAfterSizing);
             }
         }
@@ -578,7 +621,7 @@ impl Router {
             return Err(Skip::BelowCopyMinimum);
         }
         if usd < c.min_order_usd {
-            if !c.min_fill_floor || !floor_eligible {
+            if c.aggregate_small_buys || !c.min_fill_floor || !floor_eligible {
                 return Err(Skip::BelowVenueMinimum);
             }
             // FAK buys are quote-sized: lift only to the venue's $1 notional
@@ -589,7 +632,11 @@ impl Router {
         }
         let cap_fill = pol.caps.max_usd_per_fill * scale;
         if usd > cap_fill {
-            shares = whole(cap_fill / limit);
+            shares = if c.aggregate_small_buys {
+                (cap_fill / limit * 100.0).floor() / 100.0
+            } else {
+                whole(cap_fill / limit)
+            };
             if shares <= 0.0 {
                 return Err(Skip::DustAfterSizing);
             }
@@ -789,6 +836,8 @@ mod tests {
             copy_maker_sells: false,
             sell_floor_frac: 0.5,
             min_copy_usd: 0.0,
+            aggregate_small_buys: false,
+            aggregate_trigger_usd: 10.0,
             min_order_usd: 1.0,
             max_usd_per_fill: 250.0,
             daily_budget_usd: 500.0,
@@ -1167,6 +1216,29 @@ mod tests {
             Err(Skip::BelowCopyMinimum),
             "a $0.44 copy target must not be lifted to the $1 order floor"
         );
+    }
+    #[test]
+    fn aggregate_mode_uses_leader_dollars_and_actual_follower_spend() {
+        let mut c = cfg("aggregate", 1, Sizing::Pct(0.10));
+        c.aggregate_small_buys = true;
+        c.max_effective_pct = 0.10;
+        let r = Router::new(vec![ready_lane(c)]);
+        r.lane(0).unwrap().state.armed.store(true, Ordering::Relaxed);
+        let d = dec("aggregate-token", 0, 0.50, 6.0, 6.0);
+        let choose = |leader_usd, covered_usd| r.decide_with_amounts(
+            0, &d, Progress::default(),
+            Some(AggregateAmounts { leader_usd, covered_usd }),
+        );
+        assert!(choose(3.0, 0.0).is_err());
+        assert!(choose(8.0, 0.0).is_err());
+        let first = choose(12.0, 0.0).unwrap();
+        assert!((first.usd as f64 / MICRO - 1.2).abs() < 0.01);
+        assert!(choose(15.0, 1.2).is_err());
+        let second = choose(23.0, 1.2).unwrap();
+        assert!((second.usd as f64 / MICRO - 1.1).abs() < 0.01);
+        assert!(choose(23.0, 1.6).is_err(), "actual $1.6 covers $16 of leader buys");
+        let third = choose(27.0, 1.6).unwrap();
+        assert!((third.usd as f64 / MICRO - 1.1).abs() < 0.01);
     }
     #[test]
     fn a_taker_buy_is_lifted_to_one_dollar_without_a_five_share_floor() {
@@ -2446,6 +2518,8 @@ mod route_tests {
             copy_maker_sells: false,
             sell_floor_frac: 0.5,
             min_copy_usd: 0.0,
+            aggregate_small_buys: false,
+            aggregate_trigger_usd: 10.0,
             min_order_usd: 1.0,
             max_usd_per_fill: 250.0,
             daily_budget_usd: 500.0,

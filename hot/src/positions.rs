@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Completeness {
     Complete,
@@ -29,6 +29,8 @@ pub struct Positions {
 }
 pub const PAGE: usize = 500;
 pub const MAX_PAGES: usize = 50;
+const V2_PAGE: usize = 1000;
+const V2_MAX_PAGES: usize = 100;
 impl Positions {
     /// A malformed balance row cannot establish that any token is absent.
     pub fn confirms_zero(&self, token: &str, not_before: i64) -> bool {
@@ -186,6 +188,26 @@ mod tests {
         assert!(u.contains("limit=500"));
         assert!(u.contains("redeemable=true"));
     }
+    #[test]
+    fn v2_boot_page_maps_the_fields_used_by_reconciliation() {
+        let body = serde_json::json!({
+            "data": [{"token_id": "123", "current_size": 2.5, "avg_price": 0.4, "redeemable": false}],
+            "pagination": {"has_more": true, "next_cursor": "next"}
+        });
+        let (rows, cursor) = decode_v2_page(&body).unwrap();
+        assert_eq!(rows, vec![serde_json::json!({"asset": "123", "size": 2.5, "avgPrice": 0.4, "redeemable": false})]);
+        assert_eq!(cursor.as_deref(), Some("next"));
+    }
+    #[test]
+    fn v2_boot_page_refuses_a_partial_or_malformed_snapshot() {
+        let no_cursor = serde_json::json!({"data": [], "pagination": {"has_more": true}});
+        assert!(decode_v2_page(&no_cursor).is_err());
+        let bad_size = serde_json::json!({
+            "data": [{"token_id": "123", "current_size": -1.0, "redeemable": false}],
+            "pagination": {"has_more": false}
+        });
+        assert!(decode_v2_page(&bad_size).is_err());
+    }
 }
 pub async fn fetch(
     http: &reqwest::Client,
@@ -230,4 +252,99 @@ pub async fn fetch(
         completeness,
         as_of: now,
     }
+}
+
+fn decode_v2_page(body: &serde_json::Value) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
+    let data = body["data"].as_array().ok_or("missing data array")?;
+    if data.len() > V2_PAGE {
+        return Err("page exceeds requested limit".into());
+    }
+    let more = body["pagination"]["has_more"].as_bool().ok_or("missing has_more")?;
+    let next = body["pagination"]["next_cursor"].as_str().filter(|s| !s.is_empty());
+    if more && next.is_none() {
+        return Err("has_more without next_cursor".into());
+    }
+    let mut rows = Vec::with_capacity(data.len());
+    for item in data {
+        let asset = item["token_id"].as_str().filter(|s| !s.is_empty()).ok_or("missing token_id")?;
+        let size = item["current_size"].as_f64().ok_or("missing current_size")?;
+        if !size.is_finite() || size < 0.0 {
+            return Err("invalid current_size".into());
+        }
+        let avg = item["avg_price"].as_f64().unwrap_or(0.0);
+        if !avg.is_finite() || avg < 0.0 {
+            return Err("invalid avg_price".into());
+        }
+        let redeemable = item["redeemable"].as_bool().ok_or("missing redeemable")?;
+        rows.push(serde_json::json!({
+            "asset": asset, "size": size, "avgPrice": avg, "redeemable": redeemable,
+        }));
+    }
+    Ok((rows, if more { next.map(str::to_string) } else { None }))
+}
+
+/// Boot reconciliation needs a complete current-position snapshot. The legacy
+/// offset endpoint repeats its last page above offset 10000 for large wallets.
+pub async fn fetch_v2_boot(
+    http: &reqwest::Client,
+    base: &str,
+    user: &str,
+    now: i64,
+) -> Positions {
+    let mut rows = Vec::new();
+    let mut assets = HashSet::new();
+    let mut cursors = HashSet::new();
+    let mut cursor: Option<String> = None;
+    let mut completeness = Completeness::Truncated { pages: V2_MAX_PAGES, cap: V2_MAX_PAGES };
+    for page in 0..V2_MAX_PAGES {
+        let mut url = match reqwest::Url::parse(&format!("{base}/v2/positions")) {
+            Ok(url) => url,
+            Err(e) => {
+                completeness = Completeness::Failed { after_pages: page, why: format!("url: {e}") };
+                break;
+            }
+        };
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("user", user)
+                .append_pair("limit", &V2_PAGE.to_string())
+                .append_pair("filter_type", "TOKENS")
+                .append_pair("filter_amount", "0.01")
+                .append_pair("include_archived", "true");
+            if let Some(value) = &cursor {
+                query.append_pair("cursor", value);
+            }
+        }
+        let got = match http.get(url).send().await {
+            Ok(response) if response.status().is_success() => response.json::<serde_json::Value>()
+                .await.map_err(|e| format!("decode: {e}")),
+            Ok(response) => Err(format!("http {}", response.status().as_u16())),
+            Err(e) => Err(format!("transport: {e}")),
+        }.and_then(|body| decode_v2_page(&body));
+        match got {
+            Ok((batch, next)) => {
+                if batch.iter().any(|row| !assets.insert(row["asset"].as_str().unwrap().to_string())) {
+                    completeness = Completeness::Failed { after_pages: page, why: "duplicate token across pages".into() };
+                    break;
+                }
+                rows.extend(batch);
+                match next {
+                    None => {
+                        completeness = Completeness::Complete;
+                        break;
+                    }
+                    Some(value) if cursors.insert(value.clone()) => cursor = Some(value),
+                    Some(_) => {
+                        completeness = Completeness::Failed { after_pages: page, why: "repeated cursor".into() };
+                        break;
+                    }
+                }
+            }
+            Err(why) => {
+                completeness = Completeness::Failed { after_pages: page, why };
+                break;
+            }
+        }
+    }
+    Positions { rows, completeness, as_of: now }
 }

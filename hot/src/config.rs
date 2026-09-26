@@ -33,6 +33,8 @@ pub struct Bot {
     pub recovery_path: String,
     #[serde(default = "yes")]
     pub race_h2: bool,
+    #[serde(default = "yes")]
+    pub position_sweep_enabled: bool,
 }
 fn dry() -> String {
     "dry".into()
@@ -115,6 +117,10 @@ pub struct SizingToml {
     pub max_usd_per_fill: Option<f64>,
     #[serde(default)]
     pub min_copy_usd: f64,
+    #[serde(default)]
+    pub aggregate_small_buys: bool,
+    #[serde(default = "f10")]
+    pub aggregate_trigger_usd: f64,
     #[serde(default = "f1")]
     pub min_order_usd: f64,
     #[serde(default = "t")]
@@ -122,6 +128,9 @@ pub struct SizingToml {
 }
 fn f1() -> f64 {
     1.0
+}
+fn f10() -> f64 {
+    10.0
 }
 fn t() -> bool {
     true
@@ -327,6 +336,8 @@ pub fn build_runtime_lane(
         copy_maker_sells: spec.copy_maker_sells(),
         sell_floor_frac: spec.sell_floor_frac.unwrap_or(RUNTIME_SELL_FLOOR_FRAC),
         min_copy_usd: 0.0,
+        aggregate_small_buys: false,
+        aggregate_trigger_usd: 10.0,
         min_order_usd: spec.min_order_usd.unwrap_or(1.0),
         max_usd_per_fill: caps.max_usd_per_fill,
         daily_budget_usd: caps.daily_usd,
@@ -529,6 +540,8 @@ impl Root {
                     .unwrap_or(DEFAULT_SLIPPAGE),
                 sell_floor_frac: l.execution.sell_floor_frac,
                 min_copy_usd: l.sizing.min_copy_usd,
+                aggregate_small_buys: l.sizing.aggregate_small_buys,
+                aggregate_trigger_usd: l.sizing.aggregate_trigger_usd,
                 min_order_usd: l.sizing.min_order_usd,
                 max_usd_per_fill: caps.max_usd_per_fill,
                 daily_budget_usd: caps.daily_usd,
@@ -633,6 +646,15 @@ control_path = "run/operator.json"
 
         assert!(bot.signer.is_none());
     }
+    #[test]
+    fn aggregate_switch_is_opt_in_and_reaches_the_lane() {
+        let mut root = bankroll_root();
+        assert!(!root.build_lanes().unwrap()[0].cfg.aggregate_small_buys);
+        root.lane[0].sizing.aggregate_small_buys = true;
+        root.lane[0].sizing.aggregate_trigger_usd = 10.0;
+        assert!(root.build_lanes().unwrap()[0].cfg.aggregate_small_buys);
+        assert_eq!(root.build_lanes().unwrap()[0].cfg.aggregate_trigger_usd, 10.0);
+    }
 
     #[test]
     fn second_feed_uses_an_environment_url_without_embedding_it_in_toml() {
@@ -655,6 +677,7 @@ control_path = "run/operator.json"
 
         assert!((policy.seed_usd - 550.0).abs() < 1e-9);
         assert!((lane.cfg.min_copy_usd - 0.50).abs() < 1e-9);
+        assert!(!lane.cfg.aggregate_small_buys);
         assert!((policy.caps.max_open_usd - 467.50).abs() < 0.01);
         assert!((policy.caps.per_market_usd - 280.50).abs() < 0.01);
         assert!((policy.caps.max_usd_per_fill - 116.88).abs() < 0.01);
