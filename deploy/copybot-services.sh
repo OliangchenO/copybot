@@ -116,8 +116,21 @@ case "$action" in
       fi
       source "$HOME/.cargo/env"
     fi
+    if [[ -n "${COPYBOT_CARGO_HTTP_PROXY:-}" ]]; then
+      export HTTP_PROXY="$COPYBOT_CARGO_HTTP_PROXY"
+      export HTTPS_PROXY="$COPYBOT_CARGO_HTTP_PROXY"
+      export http_proxy="$COPYBOT_CARGO_HTTP_PROXY"
+      export https_proxy="$COPYBOT_CARGO_HTTP_PROXY"
+    fi
     cd "$repo_dir"
-    cargo build --locked --release --manifest-path "$script_dir/../hot/Cargo.toml" --bin copybot-hot
+    if ! cargo build --locked --release --manifest-path "$script_dir/../hot/Cargo.toml" --bin copybot-hot; then
+      cat >&2 <<'EOF'
+Build failed. If Cargo reports crates.io timeouts and WSL reports a localhost
+proxy warning, pass a proxy address reachable from WSL (enable LAN access first):
+  COPYBOT_CARGO_HTTP_PROXY=http://<windows-host-ip>:<port> bash deploy/copybot-services.sh build
+EOF
+      exit 1
+    fi
     ;;
   start)
     check_start_config
