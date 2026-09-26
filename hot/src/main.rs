@@ -1742,7 +1742,7 @@ async fn control_task(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
-const RECON_SECS: u64 = 5;
+const RECON_SECS: u64 = 60;
 const RECON_QUIET_SECS: i64 = 120;
 const RECON_RELEASE_QUIET_SECS: i64 = 1_800;
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -2366,504 +2366,8 @@ the rescue ladder. Attribute it, or flatten by hand, rather than leaving it."
             )
         }
     }
-    const UNATTRIBUTED_MIN_USD: f64 = 1.0;
-    {
-        let rec_http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
-        let fetch = |w: String| {
-            let c = rec_http.clone();
-            async move {
-                let snap = copybot_hot::positions::fetch_v2_boot(
-                        &c,
-                        "https://data-api.polymarket.com",
-                        &w,
-                        copybot_hot::ledger::now_secs(),
-                    )
-                    .await;
-                if !snap.may_act_destructively() {
-                    return Err(
-                        format!(
-                            "positions for {w} are not a complete list ({}) — \
-refusing to reconcile against a partial portfolio",
-                            snap.completeness.reason()
-                        ),
-                    );
-                }
-                Ok(snap.rows)
-            }
-        };
-        let ours_result = fetch(funder.clone()).await;
-        let ours_error = ours_result.as_ref().err().cloned();
-        let ours = ours_result.unwrap_or_default();
-        if let Some(e) = &ours_error {
-            eprintln!("[recon] ⛔ OUR chain positions unverified: {e}");
-        }
-        let safe_confirmed_empty = if ours_error.is_none() && ours.is_empty() {
-            let second = fetch(funder.clone()).await;
-            let snaps = [
-                copybot_hot::snapshot::Snapshot::Data(0),
-                match &second {
-                    Ok(v) => copybot_hot::snapshot::Snapshot::Data(v.len()),
-                    Err(e) => copybot_hot::snapshot::Snapshot::Failed(e.clone()),
-                },
-            ];
-            match copybot_hot::snapshot::judge_empty(&snaps, 2) {
-                copybot_hot::snapshot::Verdict::Believable => {
-                    eprintln!(
-                        "[recon] wallet is FLAT (confirmed by two independent \
-reads) — phantom ledger holdings will be released"
-                    );
-                    true
-                }
-                v => {
-                    eprintln!(
-                        "[recon] wallet looked flat but that is not confirmed \
-({v:?}) — treating as a bad read"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        for (lane_ix, lane) in router.snapshot().iter().enumerate() {
-            let name = lane.cfg.name.clone();
-            let w = format!("0x{}", hex::encode(lane.cfg.wallet20));
-            let his = match fetch(w).await {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("[seed] ⛔ {name}: {e}");
-                    control
-                        .lock()
-                        .unwrap()
-                        .set_boot_fault(
-                            &name,
-                            format!("leader position snapshot unavailable: {e}"),
-                        );
-                    continue;
-                }
-            };
-            if let Some(e) = &ours_error {
-                control
-                    .lock()
-                    .unwrap()
-                    .set_boot_fault(
-                        &name,
-                        format!("our position snapshot unavailable: {e}"),
-                    );
-            }
-            let mut book: std::collections::HashMap<String, f64> = Default::default();
-            for p in &his {
-                let t = p["asset"].as_str().unwrap_or("").to_string();
-                let sz = p["size"]
-                    .as_f64()
-                    .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
-                    .unwrap_or(0.0);
-                if !t.is_empty() && sz > 0.0 {
-                    book.insert(t, sz);
-                }
-            }
-            let held = control.lock().unwrap().ledger.holdings(&name);
-            let chain_sz: std::collections::HashMap<String, f64> = ours
-                .iter()
-                .filter_map(|p| {
-                    let t = p["asset"].as_str()?.to_string();
-                    let sz = p["size"]
-                        .as_f64()
-                        .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))?;
-                    Some((t, sz))
-                })
-                .collect();
-            let missing_ledger_tokens: Vec<String> = held
-                .iter()
-                .filter(|(tok, shares)| **shares > 0.01 && !chain_sz.contains_key(*tok))
-                .map(|(tok, _)| tok.clone())
-                .collect();
-            let mut chain_confirmed_absent = std::collections::HashSet::new();
-            if ours_error.is_none() {
-                let rpc_url = std::env::var("FILLWATCH_RPC")
-                    .unwrap_or_else(|_| copybot_hot::txsend::DEFAULT_RPC.to_string());
-                for tok in &missing_ledger_tokens {
-                    match copybot_hot::txsend::ctf_balance(&rec_http, &rpc_url, &funder, tok).await {
-                        Ok(balance) if balance <= 1e-6 => {
-                            chain_confirmed_absent.insert(tok.clone());
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!(
-                            "[recon] {name}: cannot verify …{} by chain: {e}",
-                            &tok[tok.len().saturating_sub(8)..]
-                        ),
-                    }
-                }
-            }
-            let all_missing_confirmed_absent = !missing_ledger_tokens.is_empty()
-                && missing_ledger_tokens.len() == chain_confirmed_absent.len();
-            let redeemable: std::collections::HashSet<String> = ours
-                .iter()
-                .filter(|p| p["redeemable"].as_bool().unwrap_or(false))
-                .filter_map(|p| p["asset"].as_str().map(str::to_string))
-                .collect();
-            let ours_known = held.values().filter(|v| **v > 0.01).count();
-            let still_there = held
-                .iter()
-                .filter(|(t, v)| **v > 0.01 && chain_sz.contains_key(*t))
-                .count();
-            let trustworthy = ours_error.is_none()
-                && (safe_confirmed_empty || ours_known == 0
-                    || still_there * 2 >= ours_known
-                    || all_missing_confirmed_absent);
-            if !trustworthy {
-                eprintln!(
-                    "[recon] {name}: REFUSING snapshot — only {still_there}/{ours_known} \
-of our positions present. Treating as a bad read, not a liquidation."
-                );
-                control
-                    .lock()
-                    .unwrap()
-                    .set_boot_fault(
-                        &name,
-                        format!(
-                            "untrusted wallet snapshot: {still_there}/{ours_known} ledger positions present"
-                        ),
-                    );
-            }
-            let mut adopted = 0usize;
-            let mut released = 0usize;
-            for (tok, sz) in &chain_sz {
-                if !book.contains_key(tok) {
-                    continue;
-                }
-                if redeemable.contains(tok) {
-                    continue;
-                }
-                if pending_tokens.iter().any(|(_, t)| t == tok) {
-                    continue;
-                }
-                let claimed_by_pool = control.lock().unwrap().ledger.pool_claim(tok);
-                let unexplained = sz - claimed_by_pool;
-                let diff = (sz - held.get(tok).copied().unwrap_or(0.0)).min(unexplained);
-                if diff <= 0.01 {
-                    continue;
-                }
-                if let Some(other) = router.owner_of(tok) {
-                    if other != lane_ix {
-                        eprintln!(
-                            "[recon] {name}: NOT adopting …{} — lane {other} owns it",
-                            & tok[tok.len().saturating_sub(8)..]
-                        );
-                        emitter
-                            .emit(
-                                serde_json::json!(
-                                    { "t" : now_ms(), "ev" : "recon_contested", "lane" : name,
-                                    "tok" : & tok[..tok.len().min(14)], "owner_lane" : other,
-                                    "shares" : diff }
-                                ),
-                            );
-                        continue;
-                    }
-                }
-                let px = ours
-                    .iter()
-                    .find(|p| p["asset"].as_str() == Some(tok.as_str()))
-                    .and_then(|p| {
-                        p["avgPrice"]
-                            .as_f64()
-                            .or_else(|| {
-                                p["avgPrice"].as_str().and_then(|x| x.parse().ok())
-                            })
-                    })
-                    .unwrap_or(0.0);
-                if px <= 0.0 {
-                    continue;
-                }
-                let had_history = control
-                    .lock()
-                    .unwrap()
-                    .ledger
-                    .lanes
-                    .get(&name)
-                    .map(|b| {
-                        b.positions.get(tok).map(|p| p.shares > 1e-9).unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                let proven = had_history
-                    || pending_log
-                        .lock()
-                        .unwrap()
-                        .open_tokens()
-                        .iter()
-                        .any(|(l, t)| l == &name && t == tok);
-                let value_usd = diff * px;
-                if !proven && value_usd >= UNATTRIBUTED_MIN_USD {
-                    let short = &tok[tok.len().saturating_sub(8)..];
-                    eprintln!(
-                        "[recon] ⛔ {name}: …{short} ({diff:.4} sh @ {px:.4}, \
-${value_usd:.2}) has NO ledger history and NO pending order — left UNATTRIBUTED"
-                    );
-                    emitter
-                        .emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "recon_unattributed", "lane" :
-                                name, "tok" : & tok[..tok.len().min(14)], "shares" : diff,
-                                "price" : px, "usd" : value_usd }
-                            ),
-                        );
-                    unattributed
-                        .lock()
-                        .unwrap()
-                        .insert(tok.clone(), (name.clone(), diff, value_usd));
-                    copybot_hot::errors::record(
-                        &errors_path,
-                        &copybot_hot::errors::ErrorRow {
-                            t: copybot_hot::ledger::now_secs(),
-                            lane: name.clone(),
-                            kind: "unattributed".into(),
-                            detail: format!(
-                                "…{short}: {diff:.4} sh @ {px:.4} (${value_usd:.2}), \
-no ledger history and no pending order"
-                            ),
-                            human: format!(
-                                "The wallet holds ${value_usd:.2} of a market that {name}'s \
-leader also trades, but nothing in our records shows we bought it. It has NOT been added \
-to {name}'s books, so we will not sell it by mistake — it may be a manual trade or another \
-strategy's. Tell us whose it is, or flatten it by hand."
-                            ),
-                            severity: "warn".into(),
-                        },
-                    );
-                    continue;
-                }
-                control
-                    .lock()
-                    .unwrap()
-                    .ledger
-                    .record_recon_fill(&name, tok, 0, diff, px, 0.0);
-                router.claim_existing(tok, lane_ix);
-                adopted += 1;
-                if !proven {
-                    eprintln!(
-                        "[recon] ⚠️  {name}: adopted …{} ({diff:.4} sh @ {px:.4}, \
-${value_usd:.2}) with NO provenance — below the ${UNATTRIBUTED_MIN_USD:.2} materiality line",
-                        & tok[tok.len().saturating_sub(8)..]
-                    );
-                    emitter
-                        .emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "recon_adopt_no_history", "lane" :
-                                name, "tok" : & tok[..tok.len().min(14)], "shares" : diff,
-                                "price" : px, "usd" : value_usd }
-                            ),
-                        );
-                }
-            }
-            if trustworthy {
-                for (tok, have) in &held {
-                    if *have <= 1e-9 {
-                        continue;
-                    }
-                    let on_chain = chain_sz.get(tok).copied().unwrap_or(0.0);
-                    let gone = have - on_chain;
-                    if gone <= 1e-9 {
-                        continue;
-                    }
-                    if gone <= 0.01 && on_chain > 0.0 {
-                        continue;
-                    }
-                    let px = control.lock().unwrap().ledger.avg_cost(&name, tok);
-                    control
-                        .lock()
-                        .unwrap()
-                        .ledger
-                        .record_recon_fill(&name, tok, 1, gone, px, 0.0);
-                    released += 1;
-                }
-            }
-            if adopted > 0 || released > 0 {
-                eprintln!(
-                    "[recon] {name}: adopted {adopted}, RELEASED {released} phantom \
-position(s) the chain no longer shows"
-                );
-                if safe_confirmed_empty && released > 0 {
-                    copybot_hot::errors::record(
-                        &errors_path,
-                        &copybot_hot::errors::ErrorRow {
-                            t: copybot_hot::ledger::now_secs(),
-                            lane: name.clone(),
-                            kind: "recon".into(),
-                            detail: format!(
-                                "wallet confirmed empty; released all {released} \
-ledger position(s) for {name}"
-                            ),
-                            human: format!(
-                                "The wallet is reported as holding nothing, confirmed twice, so \
-all {released} of {name}'s recorded positions were cleared. Profit and loss are unchanged \
-and nothing was sold. This is normal once every market has settled — but if {name} should \
-still be holding something, check that the funder address is right."
-                            ),
-                            severity: "warn".into(),
-                        },
-                    );
-                }
-            } else if !ours.is_empty() {
-                eprintln!("[recon] {name}: ledger matches the chain");
-            }
-            let now_held = control.lock().unwrap().ledger.holdings(&name);
-            if book.is_empty() && !now_held.is_empty() {
-                let reason = "leader position snapshot is empty while our ledger has holdings";
-                eprintln!("[seed] ⛔ {name}: {reason}; refusing to enable execution");
-                control.lock().unwrap().set_boot_fault(&name, reason);
-                continue;
-            }
-            let legacy = control.lock().unwrap().seed_his_book(&name, &book);
-            let now_held = now_held.len();
-            lane.mark_ready();
-            if incidents.lock().map(|g| g.latched(&name)).unwrap_or(true) {
-                lane.state.halt_latch.store(true, Ordering::Relaxed);
-                eprintln!(
-                    "[{name}] buys remain HALTED: an incident from before the \
-                           restart is still open — clear it deliberately to resume"
-                );
-            }
-            eprintln!(
-                "[seed] {name}: his book {} positions, we hold {}, {} marked legacy",
-                book.len(), now_held, legacy
-            );
-            emitter
-                .emit(
-                    serde_json::json!(
-                        { "t" : now_ms(), "ev" : "recon", "lane" : name, "adopted" :
-                        adopted, "his_positions" : book.len(), "we_hold" : now_held,
-                        "legacy" : legacy }
-                    ),
-                );
-        }
-    }
-    if live && !shadow {
-        let faults = control.lock().unwrap().boot_faults.clone();
-        if !faults.is_empty() {
-            for (lane, reason) in faults {
-                eprintln!("[boot] REFUSING LIVE EXECUTION for {lane}: {reason}");
-            }
-            std::process::exit(2);
-        }
-    }
-    if shadow {
-        let (c2, r2, e2, f2) = (
-            control.clone(),
-            router.clone(),
-            emitter.clone(),
-            funder.clone(),
-        );
-        tokio::spawn(async move {
-            let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default();
-            loop {
-                tokio::time::sleep(Duration::from_secs(300)).await;
-                let snap = copybot_hot::positions::fetch(
-                        &http,
-                        "https://data-api.polymarket.com",
-                        &f2,
-                        "0.01",
-                        "",
-                        copybot_hot::ledger::now_secs(),
-                    )
-                    .await;
-                if !snap.may_act_destructively() {
-                    continue;
-                }
-                let chain = &snap.rows;
-                for lane in r2.snapshot().iter() {
-                    let name = lane.cfg.name.clone();
-                    let held = c2.lock().unwrap().ledger.holdings(&name);
-                    let his = c2
-                        .lock()
-                        .unwrap()
-                        .his_pos
-                        .get(&name)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut adopted = 0usize;
-                    for p in chain {
-                        let tok = p["asset"].as_str().unwrap_or("").to_string();
-                        if tok.is_empty() || !his.contains_key(&tok) {
-                            continue;
-                        }
-                        let sz = p["size"]
-                            .as_f64()
-                            .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
-                            .unwrap_or(0.0);
-                        let diff = sz - held.get(&tok).copied().unwrap_or(0.0);
-                        if diff <= 0.01 {
-                            continue;
-                        }
-                        let px = p["avgPrice"]
-                            .as_f64()
-                            .or_else(|| {
-                                p["avgPrice"].as_str().and_then(|x| x.parse().ok())
-                            })
-                            .unwrap_or(0.0);
-                        if px <= 0.0 {
-                            continue;
-                        }
-                        c2.lock()
-                            .unwrap()
-                            .ledger
-                            .record_fill(&name, &tok, 0, diff, px, 0.0);
-                        adopted += 1;
-                    }
-                    if adopted > 0 {
-                        e2.emit(
-                            serde_json::json!(
-                                { "t" : now_ms(), "ev" : "recon", "lane" : name, "adopted" :
-                                adopted, "periodic" : true }
-                            ),
-                        );
-                    }
-                }
-            }
-        });
-    }
-    {
-        let supervised = tokio::spawn(
-            control_task(
-                control.clone(),
-                router.clone(),
-                pending_log.clone(),
-                emitter.clone(),
-                watch_tokens.clone(),
-                fps.clone(),
-                resting_book.clone(),
-                levels.clone(),
-                prints.clone(),
-            ),
-        );
-        let em_sup = emitter.clone();
-        tokio::spawn(async move {
-            let outcome = supervised.await;
-            let why = match &outcome {
-                Err(e) if e.is_panic() => "control task PANICKED".to_string(),
-                Err(e) => format!("control task ended abnormally: {e}"),
-                Ok(()) => "control task returned, which it must never do".to_string(),
-            };
-            eprintln!(
-                "[CRITICAL] {why} — the only writer of `armed` is gone, so the \
-kill switch is inert. Aborting so systemd restarts a coherent process."
-            );
-            em_sup
-                .emit(
-                    serde_json::json!(
-                        { "t" : now_ms(), "ev" : "control_task_died", "why" : why,
-                        "action" : "abort" }
-                    ),
-                );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            std::process::abort();
-        });
-    }
+    // Let the dashboard load during boot, but gate its controls until books are reconciled.
+    let boot_reconciled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let creds_slot: Arc<std::sync::Mutex<Option<copybot_hot::auth::ApiCreds>>> = Arc::new(
         std::sync::Mutex::new(None),
     );
@@ -2949,7 +2453,11 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                 funder_mu.clone(),
                 title_cache.clone(),
             );
+            let title_boot_ready = boot_reconciled.clone();
             tokio::spawn(async move {
+                while !title_boot_ready.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
                 const PAGE: usize = 500;
                 const MAX_PAGES: usize = 20;
                 let mut backfill_complete = false;
@@ -3013,6 +2521,7 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
             sig_type,
         );
         let signal_guard_dash = signal_guard.clone();
+        let boot_reconciled_dash = boot_reconciled.clone();
         tokio::spawn(async move {
             let lst = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
                 Ok(l) => l,
@@ -3081,6 +2590,7 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                 let unattributed_d = unattributed_dash.clone();
                 let response_times_c = response_times_dash.clone();
                 let fund_pool2 = fund_pool.clone();
+                let boot_reconciled_conn = boot_reconciled_dash.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let _permit = permit;
@@ -3127,6 +2637,31 @@ kill switch is inert. Aborting so systemd restarts a coherent process."
                                     .map(|(_, q)| q)
                                     .unwrap_or("");
                                 let _ = query;
+                                if !boot_reconciled_conn.load(Ordering::Relaxed)
+                                    && !(method == "GET"
+                                        && matches!(
+                                            path,
+                                            "/" | "/index" | "/index.html" | "/pool" | "/pool2"
+                                                | "/api/pool" | "/api/status" | "/api/errors"
+                                                | "/api/equity" | "/api/pnl" | "/api/trades"
+                                                | "/api/response_times"
+                                        ))
+                                {
+                                    let out = serde_json::json!({
+                                        "status": "initializing",
+                                        "message": "position reconciliation is still in progress"
+                                    })
+                                    .to_string();
+                                    let resp = format!(
+                                        "HTTP/1.1 503 Service Unavailable\r\n\
+                                         Content-Type: application/json\r\n\
+                                         Retry-After: 2\r\n\
+                                         Content-Length: {}\r\n\r\n{}",
+                                        out.len(), out
+                                    );
+                                    let _ = sock.write_all(resp.as_bytes()).await;
+                                    return;
+                                }
                                 if method == "GET"
                                     && (path == "/" || path == "/index"
                                         || path == "/index.html")
@@ -4147,6 +3682,505 @@ declared net external funding (deposits - withdrawals); independent of lane allo
                     }
                 });
             }
+        });
+    }
+    const UNATTRIBUTED_MIN_USD: f64 = 1.0;
+    {
+        let rec_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        let fetch = |w: String| {
+            let c = rec_http.clone();
+            async move {
+                let snap = copybot_hot::positions::fetch_v2_boot(
+                        &c,
+                        "https://data-api.polymarket.com",
+                        &w,
+                        copybot_hot::ledger::now_secs(),
+                    )
+                    .await;
+                if !snap.may_act_destructively() {
+                    return Err(
+                        format!(
+                            "positions for {w} are not a complete list ({}) — \
+refusing to reconcile against a partial portfolio",
+                            snap.completeness.reason()
+                        ),
+                    );
+                }
+                Ok(snap.rows)
+            }
+        };
+        let ours_result = fetch(funder.clone()).await;
+        let ours_error = ours_result.as_ref().err().cloned();
+        let ours = ours_result.unwrap_or_default();
+        if let Some(e) = &ours_error {
+            eprintln!("[recon] ⛔ OUR chain positions unverified: {e}");
+        }
+        let safe_confirmed_empty = if ours_error.is_none() && ours.is_empty() {
+            let second = fetch(funder.clone()).await;
+            let snaps = [
+                copybot_hot::snapshot::Snapshot::Data(0),
+                match &second {
+                    Ok(v) => copybot_hot::snapshot::Snapshot::Data(v.len()),
+                    Err(e) => copybot_hot::snapshot::Snapshot::Failed(e.clone()),
+                },
+            ];
+            match copybot_hot::snapshot::judge_empty(&snaps, 2) {
+                copybot_hot::snapshot::Verdict::Believable => {
+                    eprintln!(
+                        "[recon] wallet is FLAT (confirmed by two independent \
+reads) — phantom ledger holdings will be released"
+                    );
+                    true
+                }
+                v => {
+                    eprintln!(
+                        "[recon] wallet looked flat but that is not confirmed \
+({v:?}) — treating as a bad read"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        for (lane_ix, lane) in router.snapshot().iter().enumerate() {
+            let name = lane.cfg.name.clone();
+            let w = format!("0x{}", hex::encode(lane.cfg.wallet20));
+            let his = match fetch(w).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[seed] ⛔ {name}: {e}");
+                    control
+                        .lock()
+                        .unwrap()
+                        .set_boot_fault(
+                            &name,
+                            format!("leader position snapshot unavailable: {e}"),
+                        );
+                    continue;
+                }
+            };
+            if let Some(e) = &ours_error {
+                control
+                    .lock()
+                    .unwrap()
+                    .set_boot_fault(
+                        &name,
+                        format!("our position snapshot unavailable: {e}"),
+                    );
+            }
+            let mut book: std::collections::HashMap<String, f64> = Default::default();
+            for p in &his {
+                let t = p["asset"].as_str().unwrap_or("").to_string();
+                let sz = p["size"]
+                    .as_f64()
+                    .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
+                    .unwrap_or(0.0);
+                if !t.is_empty() && sz > 0.0 {
+                    book.insert(t, sz);
+                }
+            }
+            let held = control.lock().unwrap().ledger.holdings(&name);
+            let chain_sz: std::collections::HashMap<String, f64> = ours
+                .iter()
+                .filter_map(|p| {
+                    let t = p["asset"].as_str()?.to_string();
+                    let sz = p["size"]
+                        .as_f64()
+                        .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))?;
+                    Some((t, sz))
+                })
+                .collect();
+            let missing_ledger_tokens: Vec<String> = held
+                .iter()
+                .filter(|(tok, shares)| **shares > 0.01 && !chain_sz.contains_key(*tok))
+                .map(|(tok, _)| tok.clone())
+                .collect();
+            let mut chain_confirmed_absent = std::collections::HashSet::new();
+            if ours_error.is_none() {
+                let rpc_url = std::env::var("FILLWATCH_RPC")
+                    .unwrap_or_else(|_| copybot_hot::txsend::DEFAULT_RPC.to_string());
+                for tok in &missing_ledger_tokens {
+                    match copybot_hot::txsend::ctf_balance(&rec_http, &rpc_url, &funder, tok).await {
+                        Ok(balance) if balance <= 1e-6 => {
+                            chain_confirmed_absent.insert(tok.clone());
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!(
+                            "[recon] {name}: cannot verify …{} by chain: {e}",
+                            &tok[tok.len().saturating_sub(8)..]
+                        ),
+                    }
+                }
+            }
+            let all_missing_confirmed_absent = !missing_ledger_tokens.is_empty()
+                && missing_ledger_tokens.len() == chain_confirmed_absent.len();
+            let redeemable: std::collections::HashSet<String> = ours
+                .iter()
+                .filter(|p| p["redeemable"].as_bool().unwrap_or(false))
+                .filter_map(|p| p["asset"].as_str().map(str::to_string))
+                .collect();
+            let ours_known = held.values().filter(|v| **v > 0.01).count();
+            let still_there = held
+                .iter()
+                .filter(|(t, v)| **v > 0.01 && chain_sz.contains_key(*t))
+                .count();
+            let trustworthy = ours_error.is_none()
+                && (safe_confirmed_empty || ours_known == 0
+                    || still_there * 2 >= ours_known
+                    || all_missing_confirmed_absent);
+            if !trustworthy {
+                eprintln!(
+                    "[recon] {name}: REFUSING snapshot — only {still_there}/{ours_known} \
+of our positions present. Treating as a bad read, not a liquidation."
+                );
+                control
+                    .lock()
+                    .unwrap()
+                    .set_boot_fault(
+                        &name,
+                        format!(
+                            "untrusted wallet snapshot: {still_there}/{ours_known} ledger positions present"
+                        ),
+                    );
+            }
+            let mut adopted = 0usize;
+            let mut released = 0usize;
+            for (tok, sz) in &chain_sz {
+                if !book.contains_key(tok) {
+                    continue;
+                }
+                if redeemable.contains(tok) {
+                    continue;
+                }
+                if pending_tokens.iter().any(|(_, t)| t == tok) {
+                    continue;
+                }
+                let claimed_by_pool = control.lock().unwrap().ledger.pool_claim(tok);
+                let unexplained = sz - claimed_by_pool;
+                let diff = (sz - held.get(tok).copied().unwrap_or(0.0)).min(unexplained);
+                if diff <= 0.01 {
+                    continue;
+                }
+                if let Some(other) = router.owner_of(tok) {
+                    if other != lane_ix {
+                        eprintln!(
+                            "[recon] {name}: NOT adopting …{} — lane {other} owns it",
+                            & tok[tok.len().saturating_sub(8)..]
+                        );
+                        emitter
+                            .emit(
+                                serde_json::json!(
+                                    { "t" : now_ms(), "ev" : "recon_contested", "lane" : name,
+                                    "tok" : & tok[..tok.len().min(14)], "owner_lane" : other,
+                                    "shares" : diff }
+                                ),
+                            );
+                        continue;
+                    }
+                }
+                let px = ours
+                    .iter()
+                    .find(|p| p["asset"].as_str() == Some(tok.as_str()))
+                    .and_then(|p| {
+                        p["avgPrice"]
+                            .as_f64()
+                            .or_else(|| {
+                                p["avgPrice"].as_str().and_then(|x| x.parse().ok())
+                            })
+                    })
+                    .unwrap_or(0.0);
+                if px <= 0.0 {
+                    continue;
+                }
+                let had_history = control
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .lanes
+                    .get(&name)
+                    .map(|b| {
+                        b.positions.get(tok).map(|p| p.shares > 1e-9).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                let proven = had_history
+                    || pending_log
+                        .lock()
+                        .unwrap()
+                        .open_tokens()
+                        .iter()
+                        .any(|(l, t)| l == &name && t == tok);
+                let value_usd = diff * px;
+                if !proven && value_usd >= UNATTRIBUTED_MIN_USD {
+                    let short = &tok[tok.len().saturating_sub(8)..];
+                    eprintln!(
+                        "[recon] ⛔ {name}: …{short} ({diff:.4} sh @ {px:.4}, \
+${value_usd:.2}) has NO ledger history and NO pending order — left UNATTRIBUTED"
+                    );
+                    emitter
+                        .emit(
+                            serde_json::json!(
+                                { "t" : now_ms(), "ev" : "recon_unattributed", "lane" :
+                                name, "tok" : & tok[..tok.len().min(14)], "shares" : diff,
+                                "price" : px, "usd" : value_usd }
+                            ),
+                        );
+                    unattributed
+                        .lock()
+                        .unwrap()
+                        .insert(tok.clone(), (name.clone(), diff, value_usd));
+                    copybot_hot::errors::record(
+                        &errors_path,
+                        &copybot_hot::errors::ErrorRow {
+                            t: copybot_hot::ledger::now_secs(),
+                            lane: name.clone(),
+                            kind: "unattributed".into(),
+                            detail: format!(
+                                "…{short}: {diff:.4} sh @ {px:.4} (${value_usd:.2}), \
+no ledger history and no pending order"
+                            ),
+                            human: format!(
+                                "The wallet holds ${value_usd:.2} of a market that {name}'s \
+leader also trades, but nothing in our records shows we bought it. It has NOT been added \
+to {name}'s books, so we will not sell it by mistake — it may be a manual trade or another \
+strategy's. Tell us whose it is, or flatten it by hand."
+                            ),
+                            severity: "warn".into(),
+                        },
+                    );
+                    continue;
+                }
+                control
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .record_recon_fill(&name, tok, 0, diff, px, 0.0);
+                router.claim_existing(tok, lane_ix);
+                adopted += 1;
+                if !proven {
+                    eprintln!(
+                        "[recon] ⚠️  {name}: adopted …{} ({diff:.4} sh @ {px:.4}, \
+${value_usd:.2}) with NO provenance — below the ${UNATTRIBUTED_MIN_USD:.2} materiality line",
+                        & tok[tok.len().saturating_sub(8)..]
+                    );
+                    emitter
+                        .emit(
+                            serde_json::json!(
+                                { "t" : now_ms(), "ev" : "recon_adopt_no_history", "lane" :
+                                name, "tok" : & tok[..tok.len().min(14)], "shares" : diff,
+                                "price" : px, "usd" : value_usd }
+                            ),
+                        );
+                }
+            }
+            if trustworthy {
+                for (tok, have) in &held {
+                    if *have <= 1e-9 {
+                        continue;
+                    }
+                    let on_chain = chain_sz.get(tok).copied().unwrap_or(0.0);
+                    let gone = have - on_chain;
+                    if gone <= 1e-9 {
+                        continue;
+                    }
+                    if gone <= 0.01 && on_chain > 0.0 {
+                        continue;
+                    }
+                    let px = control.lock().unwrap().ledger.avg_cost(&name, tok);
+                    control
+                        .lock()
+                        .unwrap()
+                        .ledger
+                        .record_recon_fill(&name, tok, 1, gone, px, 0.0);
+                    released += 1;
+                }
+            }
+            if adopted > 0 || released > 0 {
+                eprintln!(
+                    "[recon] {name}: adopted {adopted}, RELEASED {released} phantom \
+position(s) the chain no longer shows"
+                );
+                if safe_confirmed_empty && released > 0 {
+                    copybot_hot::errors::record(
+                        &errors_path,
+                        &copybot_hot::errors::ErrorRow {
+                            t: copybot_hot::ledger::now_secs(),
+                            lane: name.clone(),
+                            kind: "recon".into(),
+                            detail: format!(
+                                "wallet confirmed empty; released all {released} \
+ledger position(s) for {name}"
+                            ),
+                            human: format!(
+                                "The wallet is reported as holding nothing, confirmed twice, so \
+all {released} of {name}'s recorded positions were cleared. Profit and loss are unchanged \
+and nothing was sold. This is normal once every market has settled — but if {name} should \
+still be holding something, check that the funder address is right."
+                            ),
+                            severity: "warn".into(),
+                        },
+                    );
+                }
+            } else if !ours.is_empty() {
+                eprintln!("[recon] {name}: ledger matches the chain");
+            }
+            let now_held = control.lock().unwrap().ledger.holdings(&name);
+            if book.is_empty() && !now_held.is_empty() {
+                let reason = "leader position snapshot is empty while our ledger has holdings";
+                eprintln!("[seed] ⛔ {name}: {reason}; refusing to enable execution");
+                control.lock().unwrap().set_boot_fault(&name, reason);
+                continue;
+            }
+            let legacy = control.lock().unwrap().seed_his_book(&name, &book);
+            let now_held = now_held.len();
+            lane.mark_ready();
+            if incidents.lock().map(|g| g.latched(&name)).unwrap_or(true) {
+                lane.state.halt_latch.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "[{name}] buys remain HALTED: an incident from before the \
+                           restart is still open — clear it deliberately to resume"
+                );
+            }
+            eprintln!(
+                "[seed] {name}: his book {} positions, we hold {}, {} marked legacy",
+                book.len(), now_held, legacy
+            );
+            emitter
+                .emit(
+                    serde_json::json!(
+                        { "t" : now_ms(), "ev" : "recon", "lane" : name, "adopted" :
+                        adopted, "his_positions" : book.len(), "we_hold" : now_held,
+                        "legacy" : legacy }
+                    ),
+                );
+        }
+    }
+    if live && !shadow {
+        let faults = control.lock().unwrap().boot_faults.clone();
+        if !faults.is_empty() {
+            for (lane, reason) in faults {
+                eprintln!("[boot] REFUSING LIVE EXECUTION for {lane}: {reason}");
+            }
+            std::process::exit(2);
+        }
+    }
+    boot_reconciled.store(true, Ordering::Relaxed);
+    if shadow {
+        let (c2, r2, e2, f2) = (
+            control.clone(),
+            router.clone(),
+            emitter.clone(),
+            funder.clone(),
+        );
+        tokio::spawn(async move {
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_default();
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                let snap = copybot_hot::positions::fetch(
+                        &http,
+                        "https://data-api.polymarket.com",
+                        &f2,
+                        "0.01",
+                        "",
+                        copybot_hot::ledger::now_secs(),
+                    )
+                    .await;
+                if !snap.may_act_destructively() {
+                    continue;
+                }
+                let chain = &snap.rows;
+                for lane in r2.snapshot().iter() {
+                    let name = lane.cfg.name.clone();
+                    let held = c2.lock().unwrap().ledger.holdings(&name);
+                    let his = c2
+                        .lock()
+                        .unwrap()
+                        .his_pos
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut adopted = 0usize;
+                    for p in chain {
+                        let tok = p["asset"].as_str().unwrap_or("").to_string();
+                        if tok.is_empty() || !his.contains_key(&tok) {
+                            continue;
+                        }
+                        let sz = p["size"]
+                            .as_f64()
+                            .or_else(|| p["size"].as_str().and_then(|x| x.parse().ok()))
+                            .unwrap_or(0.0);
+                        let diff = sz - held.get(&tok).copied().unwrap_or(0.0);
+                        if diff <= 0.01 {
+                            continue;
+                        }
+                        let px = p["avgPrice"]
+                            .as_f64()
+                            .or_else(|| {
+                                p["avgPrice"].as_str().and_then(|x| x.parse().ok())
+                            })
+                            .unwrap_or(0.0);
+                        if px <= 0.0 {
+                            continue;
+                        }
+                        c2.lock()
+                            .unwrap()
+                            .ledger
+                            .record_fill(&name, &tok, 0, diff, px, 0.0);
+                        adopted += 1;
+                    }
+                    if adopted > 0 {
+                        e2.emit(
+                            serde_json::json!(
+                                { "t" : now_ms(), "ev" : "recon", "lane" : name, "adopted" :
+                                adopted, "periodic" : true }
+                            ),
+                        );
+                    }
+                }
+            }
+        });
+    }
+    {
+        let supervised = tokio::spawn(
+            control_task(
+                control.clone(),
+                router.clone(),
+                pending_log.clone(),
+                emitter.clone(),
+                watch_tokens.clone(),
+                fps.clone(),
+                resting_book.clone(),
+                levels.clone(),
+                prints.clone(),
+            ),
+        );
+        let em_sup = emitter.clone();
+        tokio::spawn(async move {
+            let outcome = supervised.await;
+            let why = match &outcome {
+                Err(e) if e.is_panic() => "control task PANICKED".to_string(),
+                Err(e) => format!("control task ended abnormally: {e}"),
+                Ok(()) => "control task returned, which it must never do".to_string(),
+            };
+            eprintln!(
+                "[CRITICAL] {why} — the only writer of `armed` is gone, so the \
+kill switch is inert. Aborting so systemd restarts a coherent process."
+            );
+            em_sup
+                .emit(
+                    serde_json::json!(
+                        { "t" : now_ms(), "ev" : "control_task_died", "why" : why,
+                        "action" : "abort" }
+                    ),
+                );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            std::process::abort();
         });
     }
     let txstats = Arc::new(TxpoolStats::default());

@@ -220,6 +220,7 @@ pub async fn fetch(
     let mut rows = Vec::new();
     let mut lens = Vec::new();
     let mut failed = None;
+    let mut previous_full_page: Option<Vec<String>> = None;
     for page in 0..MAX_PAGES {
         let url = page_url(base, user, size_threshold, page * PAGE, extra);
         let got = match http.get(&url).send().await {
@@ -234,6 +235,19 @@ pub async fn fetch(
         match got {
             Ok(batch) => {
                 let n = batch.len();
+                let assets: Option<Vec<String>> = batch
+                    .iter()
+                    .map(|row| row["asset"].as_str().map(str::to_owned))
+                    .collect();
+                if let Some(assets) = assets {
+                    if n == PAGE && previous_full_page.as_ref() == Some(&assets) {
+                        failed = Some((page, "provider repeated a full positions page".into()));
+                        break;
+                    }
+                    previous_full_page = if n == PAGE { Some(assets) } else { None };
+                } else {
+                    previous_full_page = None;
+                }
                 rows.extend(batch);
                 lens.push(n);
                 if n < PAGE {
